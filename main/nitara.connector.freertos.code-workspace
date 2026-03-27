@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": "../../nitara.connector.freertos"
+		},
+		{
+			"path": ".."
+		}
+	],
+	"settings": {
+		"C_Cpp.workspaceParsingPriority": "high"
+	}
+}

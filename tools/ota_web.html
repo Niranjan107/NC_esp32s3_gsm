@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NCLite BLE OTA Upload</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        h1 { color: #333; text-align: center; }
+        .card {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 15px 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .status {
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+            font-weight: bold;
+        }
+        .status.disconnected { background: #ffebee; color: #c62828; }
+        .status.connected { background: #e8f5e9; color: #2e7d32; }
+        .status.uploading { background: #e3f2fd; color: #1565c0; }
+        .status.success { background: #e8f5e9; color: #2e7d32; }
+        .status.error { background: #ffebee; color: #c62828; }
+        button {
+            background: #1976d2;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            width: 100%;
+            margin: 5px 0;
+        }
+        button:hover { background: #1565c0; }
+        button:disabled { background: #bdbdbd; cursor: not-allowed; }
+        button.danger { background: #d32f2f; }
+        button.danger:hover { background: #c62828; }
+        input[type="file"] {
+            width: 100%;
+            padding: 10px;
+            margin: 10px 0;
+            border: 2px dashed #ccc;
+            border-radius: 4px;
+        }
+        .progress-container {
+            background: #e0e0e0;
+            border-radius: 4px;
+            overflow: hidden;
+            height: 30px;
+            margin: 10px 0;
+        }
+        .progress-bar {
+            background: #4caf50;
+            height: 100%;
+            width: 0%;
+            transition: width 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+        }
+        .log {
+            background: #263238;
+            color: #aed581;
+            padding: 15px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 12px;
+            max-height: 200px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+        }
+        .info { font-size: 14px; color: #666; margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <h1>NCLite BLE OTA Upload</h1>
+
+    <div class="card">
+        <h3>1. Connect to Device</h3>
+        <div id="connectionStatus" class="status disconnected">Disconnected</div>
+        <button id="connectBtn" onclick="connect()">Connect to NitaraCLE4</button>
+        <button id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
+    </div>
+
+    <div class="card">
+        <h3>2. Select Firmware</h3>
+        <input type="file" id="firmwareFile" accept=".bin" onchange="fileSelected()">
+        <div id="fileInfo" class="info">No file selected</div>
+    </div>
+
+    <div class="card">
+        <h3>3. Upload Firmware</h3>
+        <div class="progress-container">
+            <div id="progressBar" class="progress-bar">0%</div>
+        </div>
+        <button id="uploadBtn" onclick="startUpload()" disabled>Start OTA Upload</button>
+        <button id="abortBtn" onclick="abortUpload()" class="danger" disabled>Abort Upload</button>
+    </div>
+
+    <div class="card">
+        <h3>Log</h3>
+        <div id="log" class="log">Ready...\n</div>
+    </div>
+
+    <script>
+        // Nordic UART Service UUIDs
+        const NUS_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+        const NUS_RX_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';  // Write to device
+        const NUS_TX_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';  // Notify from device
+
+        // OTA Configuration
+        const CHUNK_SIZE = 300;  // Binary bytes per chunk
+
+        let device = null;
+        let rxCharacteristic = null;
+        let txCharacteristic = null;
+        let firmwareData = null;
+        let isUploading = false;
+        let responseResolve = null;
+        let responseBuffer = '';  // Buffer for accumulating fragmented responses
+        let currentCmdId = 0;     // Unique ID for each command to prevent stale timeout issues
+
+        function log(msg) {
+            const logDiv = document.getElementById('log');
+            const time = new Date().toLocaleTimeString();
+            logDiv.textContent += `[${time}] ${msg}\n`;
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        function setStatus(status, text) {
+            const el = document.getElementById('connectionStatus');
+            el.className = 'status ' + status;
+            el.textContent = text;
+        }
+
+        function setProgress(pct) {
+            const bar = document.getElementById('progressBar');
+            bar.style.width = pct + '%';
+            bar.textContent = pct + '%';
+        }
+
+        async function connect() {
+            try {
+                log('Scanning for BLE devices...');
+                device = await navigator.bluetooth.requestDevice({
+                    filters: [{ namePrefix: 'NitaraCLE' }],
+                    optionalServices: [NUS_SERVICE_UUID]
+                });
+
+                log(`Found: ${device.name}`);
+                device.addEventListener('gattserverdisconnected', onDisconnected);
+
+                log('Connecting...');
+                const server = await device.gatt.connect();
+
+                log('Getting NUS service...');
+                const service = await server.getPrimaryService(NUS_SERVICE_UUID);
+
+                log('Getting characteristics...');
+                rxCharacteristic = await service.getCharacteristic(NUS_RX_UUID);
+                txCharacteristic = await service.getCharacteristic(NUS_TX_UUID);
+
+                // Enable notifications
+                await txCharacteristic.startNotifications();
+                txCharacteristic.addEventListener('characteristicvaluechanged', onNotification);
+
+                setStatus('connected', `Connected to ${device.name}`);
+                log('Connected and ready!');
+
+                document.getElementById('connectBtn').disabled = true;
+                document.getElementById('disconnectBtn').disabled = false;
+                updateUploadButton();
+
+            } catch (error) {
+                log(`Error: ${error.message}`);
+                setStatus('error', 'Connection failed');
+            }
+        }
+
+        function onDisconnected() {
+            log('Device disconnected');
+            setStatus('disconnected', 'Disconnected');
+            device = null;
+            rxCharacteristic = null;
+            txCharacteristic = null;
+            document.getElementById('connectBtn').disabled = false;
+            document.getElementById('disconnectBtn').disabled = true;
+            document.getElementById('uploadBtn').disabled = true;
+            document.getElementById('abortBtn').disabled = true;
+        }
+
+        async function disconnect() {
+            if (device && device.gatt.connected) {
+                await device.gatt.disconnect();
+            }
+        }
+
+        function onNotification(event) {
+            const value = event.target.value;
+            const text = new TextDecoder().decode(value);
+
+            // Accumulate data in buffer
+            responseBuffer += text;
+
+            // Try to parse complete JSON
+            if (responseResolve) {
+                // Trim whitespace and remove any trailing garbage
+                let cleanBuffer = responseBuffer.trim();
+
+                // Try to find complete JSON object
+                const lastBrace = cleanBuffer.lastIndexOf('}');
+                if (lastBrace >= 0) {
+                    cleanBuffer = cleanBuffer.substring(0, lastBrace + 1);
+                }
+
+                try {
+                    const json = JSON.parse(cleanBuffer);
+                    log(`<- ${JSON.stringify(json).substring(0, 80)}...`);
+                    responseResolve(json);
+                    responseResolve = null;
+                    responseBuffer = '';
+                } catch (e) {
+                    // JSON incomplete, wait for more data
+                    log(`<- [partial: ${responseBuffer.length} bytes] ${responseBuffer.substring(0, 50)}...`);
+                }
+            }
+        }
+
+        async function sendCommand(cmd, timeout = 15000) {
+            const cmdStr = JSON.stringify(cmd) + '#';
+            const encoder = new TextEncoder();
+            const data = encoder.encode(cmdStr);
+
+            // Clear response buffer before sending
+            responseBuffer = '';
+
+            // Increment command ID to invalidate any pending timeouts from previous commands
+            currentCmdId++;
+            const myCmdId = currentCmdId;
+
+            // Create promise FIRST, then send command
+            const responsePromise = new Promise((resolve) => {
+                responseResolve = resolve;
+                setTimeout(() => {
+                    // Only process if this is still the current command (prevents stale timeouts)
+                    if (myCmdId !== currentCmdId) {
+                        return;  // Stale timeout, ignore
+                    }
+                    if (responseResolve) {
+                        // Try to parse buffer one more time before giving up
+                        if (responseBuffer.length > 0) {
+                            try {
+                                let cleanBuffer = responseBuffer.trim();
+                                const lastBrace = cleanBuffer.lastIndexOf('}');
+                                if (lastBrace >= 0) {
+                                    cleanBuffer = cleanBuffer.substring(0, lastBrace + 1);
+                                    const json = JSON.parse(cleanBuffer);
+                                    responseResolve(json);
+                                    responseResolve = null;
+                                    responseBuffer = '';
+                                    return;
+                                }
+                            } catch (e) { }
+                        }
+                        responseResolve(null);
+                        responseResolve = null;
+                        responseBuffer = '';
+                    }
+                }, timeout);
+            });
+
+            // Now send the command
+            const chunkSize = 500;
+            for (let i = 0; i < data.length; i += chunkSize) {
+                const chunk = data.slice(i, i + chunkSize);
+                await rxCharacteristic.writeValue(chunk);
+            }
+
+            return responsePromise;
+        }
+
+        function fileSelected() {
+            const input = document.getElementById('firmwareFile');
+            const info = document.getElementById('fileInfo');
+
+            if (input.files.length > 0) {
+                const file = input.files[0];
+                info.textContent = `${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
+
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    firmwareData = new Uint8Array(e.target.result);
+                    log(`Loaded: ${file.name} (${firmwareData.length} bytes)`);
+                    updateUploadButton();
+                };
+                reader.readAsArrayBuffer(file);
+            } else {
+                info.textContent = 'No file selected';
+                firmwareData = null;
+                updateUploadButton();
+            }
+        }
+
+        function updateUploadButton() {
+            const canUpload = rxCharacteristic && firmwareData && !isUploading;
+            document.getElementById('uploadBtn').disabled = !canUpload;
+        }
+
+        async function startUpload() {
+            if (!rxCharacteristic || !firmwareData) return;
+
+            isUploading = true;
+            document.getElementById('uploadBtn').disabled = true;
+            document.getElementById('abortBtn').disabled = false;
+            setStatus('uploading', 'Uploading...');
+            setProgress(0);
+
+            try {
+                // Step 1: Begin OTA
+                log(`-> ota_begin (size: ${firmwareData.length})`);
+                let resp = await sendCommand({ command: 'ota_begin', size: firmwareData.length });
+
+                if (!resp || resp.status_code !== 0) {
+                    throw new Error(`ota_begin failed: ${JSON.stringify(resp)}`);
+                }
+                log('OTA ready');
+
+                // Step 2: Send chunks with retry logic
+                const totalChunks = Math.ceil(firmwareData.length / CHUNK_SIZE);
+                const MAX_RETRIES = 3;
+                log(`Sending ${totalChunks} chunks...`);
+
+                for (let seq = 0; seq < totalChunks && isUploading; seq++) {
+                    const offset = seq * CHUNK_SIZE;
+                    const chunk = firmwareData.slice(offset, offset + CHUNK_SIZE);
+                    const b64 = btoa(String.fromCharCode(...chunk));
+
+                    let success = false;
+                    for (let retry = 0; retry < MAX_RETRIES && !success; retry++) {
+                        if (retry > 0) {
+                            log(`[Retry ${retry}] seq=${seq}`);
+                            await new Promise(r => setTimeout(r, 500)); // Wait before retry
+                        }
+
+                        // Only log every 50 chunks or on retry
+                        if (seq % 50 === 0 || retry > 0) {
+                            log(`-> ota_write seq=${seq}/${totalChunks - 1}`);
+                        }
+
+                        resp = await sendCommand({
+                            command: 'ota_write',
+                            seq: seq,
+                            data: b64
+                        }, 5000);  // 5 second timeout for write
+
+                        if (resp && resp.status_code === 0) {
+                            success = true;
+                            const pct = resp.data?.pct || Math.round(((seq + 1) / totalChunks) * 100);
+                            setProgress(pct);
+                            // Small delay between chunks to prevent BLE buffer overflow
+                            await new Promise(r => setTimeout(r, 30));
+                        }
+                    }
+
+                    if (!success) {
+                        throw new Error(`ota_write failed at seq ${seq} after ${MAX_RETRIES} retries`);
+                    }
+                }
+
+                if (!isUploading) {
+                    throw new Error('Upload aborted by user');
+                }
+
+                // Step 3: End OTA
+                log('-> ota_end');
+                resp = await sendCommand({ command: 'ota_end' });
+
+                if (!resp || resp.status_code !== 0) {
+                    throw new Error(`ota_end failed: ${JSON.stringify(resp)}`);
+                }
+
+                setStatus('success', 'OTA Complete! Device rebooting...');
+                log('OTA SUCCESS! Device will reboot to new firmware.');
+                setProgress(100);
+
+            } catch (error) {
+                log(`ERROR: ${error.message}`);
+                setStatus('error', 'Upload failed');
+                await sendCommand({ command: 'ota_abort' });
+            }
+
+            isUploading = false;
+            document.getElementById('abortBtn').disabled = true;
+            updateUploadButton();
+        }
+
+        async function abortUpload() {
+            log('Aborting upload...');
+            isUploading = false;
+            await sendCommand({ command: 'ota_abort' });
+            setStatus('error', 'Upload aborted');
+            document.getElementById('abortBtn').disabled = true;
+            updateUploadButton();
+        }
+
+        // Check Web Bluetooth support
+        if (!navigator.bluetooth) {
+            log('ERROR: Web Bluetooth not supported in this browser!');
+            log('Use Chrome on Windows, macOS, Android, or ChromeOS.');
+            document.getElementById('connectBtn').disabled = true;
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+idf_component_register(
+    SRCS "wm_uart.c"
+    INCLUDE_DIRS "."
+    REQUIRES driver common config esp_timer
+)

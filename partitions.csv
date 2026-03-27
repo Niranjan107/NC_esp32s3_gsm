@@ -1,0 +1,14 @@
+# ESP32-S3 Partition Table for NCLite with OTA Support
+# Name,   Type, SubType,  Offset,   Size,    Flags
+# NVS partition for configuration storage
+nvs,      data, nvs,      0x9000,   0x4000,
+# OTA data partition (stores which OTA slot to boot)
+otadata,  data, ota,      0xd000,   0x2000,
+# PHY init data
+phy_init, data, phy,      0xf000,   0x1000,
+# OTA partition 0 (primary app)
+ota_0,    app,  ota_0,    0x10000,  0x180000,
+# OTA partition 1 (secondary app for updates)
+ota_1,    app,  ota_1,    0x190000, 0x180000,
+# NVS key partition (optional, for encryption)
+nvs_key,  data, nvs_keys, 0x310000, 0x1000,

@@ -1,0 +1,252 @@
+menu "NCLite CLEV4"
+
+    menu "WM (Weighing Machine) UART"
+        config NCLE_WM_ENABLE
+            bool "Enable WM Module"
+            default y
+            help
+                Enable Weighing Machine UART module.
+                Disable to exclude WM functionality from the build.
+
+        config NCLE_WM_UART_NUM
+            int "WM UART Port Number (0, 1, or 2)"
+            default 0
+            range 0 2
+            depends on NCLE_WM_ENABLE
+            help
+                UART port number for Weighing Machine
+
+        config NCLE_WM_UART_TX_ENABLE
+            bool "Enable WM UART TX Pin"
+            default n
+            depends on NCLE_WM_ENABLE
+            help
+                Enable TX pin for WM UART. Disable if only receiving data
+                from weighing machine (prevents garbage output on TX).
+
+        config NCLE_WM_UART_TX_PIN
+            int "WM UART TX GPIO"
+            default 43
+            range 0 48
+            depends on NCLE_WM_UART_TX_ENABLE
+            help
+                GPIO pin for WM UART TX
+
+        config NCLE_WM_UART_RX_PIN
+            int "WM UART RX GPIO"
+            default 44
+            range 0 48
+            depends on NCLE_WM_ENABLE
+            help
+                GPIO pin for WM UART RX
+
+        config NCLE_WM_UART_BAUD_RATE
+            int "WM UART Baud Rate"
+            default 9600
+            depends on NCLE_WM_ENABLE
+            help
+                Baud rate for WM UART
+
+        config NCLE_WM_UART_BUF_SIZE
+            int "WM UART Buffer Size"
+            default 256
+            range 128 1024
+            depends on NCLE_WM_ENABLE
+            help
+                Buffer size for WM UART RX/TX
+    endmenu
+
+    menu "MA (Milk Analyzer) UART"
+        config NCLE_MA_ENABLE
+            bool "Enable MA Module"
+            default y
+            help
+                Enable Milk Analyzer UART module.
+                Disable to exclude MA functionality from the build.
+
+        config NCLE_MA_UART_NUM
+            int "MA UART Port Number (0, 1, or 2)"
+            default 2
+            range 0 2
+            depends on NCLE_MA_ENABLE
+            help
+                UART port number for Milk Analyzer.
+                Default: UART2
+
+        config NCLE_MA_UART_TX_PIN
+            int "MA UART TX GPIO"
+            default 40
+            range 0 48
+            depends on NCLE_MA_ENABLE
+            help
+                GPIO pin for MA UART TX.
+                Default: GPIO40 (U2TX_MA in schematic)
+
+        config NCLE_MA_UART_RX_PIN
+            int "MA UART RX GPIO"
+            default 39
+            range 0 48
+            depends on NCLE_MA_ENABLE
+            help
+                GPIO pin for MA UART RX.
+                Default: GPIO39 (U2RX_MA in schematic)
+
+        config NCLE_MA_UART_BAUD_RATE
+            int "MA UART Default Baud Rate"
+            default 9600
+            depends on NCLE_MA_ENABLE
+            help
+                Default baud rate for MA UART (configurable via menuconfig or JSON command)
+
+        config NCLE_MA_UART_BUF_SIZE
+            int "MA UART Buffer Size"
+            default 1024
+            range 256 2048
+            depends on NCLE_MA_ENABLE
+            help
+                Buffer size for MA UART RX/TX.
+                MA data packets can be larger than WM.
+    endmenu
+
+    menu "Printer UART"
+        config NCLE_PRINTER_ENABLE
+            bool "Enable Printer Module"
+            default y
+            help
+                Enable Thermal Printer UART module.
+                Disable to exclude Printer functionality from the build.
+
+        config NCLE_PRINTER_UART_NUM
+            int "Printer UART Port Number (0, 1, or 2)"
+            default 1
+            range 0 2
+            depends on NCLE_PRINTER_ENABLE
+            help
+                UART port number for Thermal Printer.
+                Default: UART1
+
+        config NCLE_PRINTER_UART_TX_PIN
+            int "Printer UART TX GPIO"
+            default 17
+            range 0 48
+            depends on NCLE_PRINTER_ENABLE
+            help
+                GPIO pin for Printer UART TX (data to printer).
+                Default: GPIO17
+
+        config NCLE_PRINTER_UART_RX_PIN
+            int "Printer UART RX GPIO"
+            default 18
+            range 0 48
+            depends on NCLE_PRINTER_ENABLE
+            help
+                GPIO pin for Printer UART RX (status from printer).
+                Default: GPIO18
+
+        config NCLE_PRINTER_UART_BAUD_RATE
+            int "Printer UART Default Baud Rate"
+            default 9600
+            depends on NCLE_PRINTER_ENABLE
+            help
+                Default baud rate for Printer UART.
+
+        config NCLE_PRINTER_UART_BUF_SIZE
+            int "Printer UART Buffer Size"
+            default 256
+            range 128 512
+            depends on NCLE_PRINTER_ENABLE
+            help
+                Buffer size for Printer UART RX/TX.
+
+        config NCLE_PRINTER_RECEIPT_BUF_SIZE
+            int "Receipt Storage Buffer Size"
+            default 2048
+            range 1024 4096
+            depends on NCLE_PRINTER_ENABLE
+            help
+                Buffer size for storing receipt data (for reprint).
+    endmenu
+
+    menu "Status LED"
+        config NCLE_STATUS_LED_GPIO
+            int "Status LED GPIO Pin"
+            default 36
+            range 0 48
+            help
+                GPIO pin for the status/activity LED.
+                Default: GPIO36 (active_led in schematic)
+
+        config NCLE_STATUS_LED_ACTIVE_HIGH
+            bool "LED Active High"
+            default y
+            help
+                If enabled, LED turns ON when GPIO is HIGH.
+                If disabled, LED turns ON when GPIO is LOW (inverted).
+    endmenu
+
+    menu "Battery Monitor"
+        config NCLE_BATTERY_ENABLE
+            bool "Enable Battery Monitor"
+            default y
+            help
+                Enable battery voltage monitoring via ADC.
+                Disable to exclude battery monitoring from the build.
+
+        config NCLE_BATTERY_ADC_GPIO
+            int "Battery ADC GPIO Pin"
+            default 6
+            range 1 10
+            depends on NCLE_BATTERY_ENABLE
+            help
+                GPIO pin for battery voltage ADC input.
+                ESP32-S3 ADC1: GPIO1-10 (ADC1_CH0-9)
+                Default: GPIO6 (ADC1_CH5)
+
+        config NCLE_BATTERY_DIVIDER_RATIO
+            int "Voltage Divider Ratio (x100)"
+            default 200
+            range 100 1000
+            depends on NCLE_BATTERY_ENABLE
+            help
+                Voltage divider ratio multiplied by 100.
+                Example: For 100K/100K divider (2:1 ratio), enter 200.
+                Example: For 200K/100K divider (3:1 ratio), enter 300.
+                Default: 200 (2:1 ratio)
+
+        config NCLE_BATTERY_FULL_MV
+            int "Battery Full Voltage (mV)"
+            default 4200
+            range 3000 10000
+            depends on NCLE_BATTERY_ENABLE
+            help
+                Battery voltage at 100% charge (in millivolts).
+                Default: 4200 (single Li-Ion cell)
+
+        config NCLE_BATTERY_EMPTY_MV
+            int "Battery Empty Voltage (mV)"
+            default 3000
+            range 2500 8000
+            depends on NCLE_BATTERY_ENABLE
+            help
+                Battery voltage at 0% charge (in millivolts).
+                Default: 3000 (single Li-Ion cell cutoff)
+    endmenu
+
+    menu "OTA Update"
+        config NCLE_OTA_ENABLE
+            bool "Enable OTA Updates"
+            default y
+            help
+                Enable Over-The-Air firmware updates via BLE.
+                Requires OTA partition table (partitions.csv with ota_0, ota_1).
+
+        config NCLE_OTA_ROLLBACK_ENABLE
+            bool "Enable Automatic Rollback"
+            default y
+            depends on NCLE_OTA_ENABLE
+            help
+                Enable automatic rollback to previous firmware if new
+                firmware fails to boot properly.
+    endmenu
+
+endmenu

@@ -1,0 +1,720 @@
+/**
+ * @file main.c
+ * @brief NCLite ESP32-S3 - Main Application Entry Point
+ *
+ * ============================================================================
+ * PURPOSE:
+ * ============================================================================
+ * This is the main entry point for the NCLite ESP32-S3 dairy connector.
+ * It initializes all hardware components and starts the system.
+ *
+ * ============================================================================
+ * WHAT THIS FILE DOES:
+ * ============================================================================
+ * 1. Initializes NVS (Non-Volatile Storage) for saving configurations
+ * 2. Initializes USB console for debugging and JSON commands
+ * 3. Initializes BLE for mobile app communication
+ * 4. Initializes WM (Weighing Machine) UART for weight data
+ * 5. Initializes MA (Milk Analyzer) UART for milk quality data
+ * 6. Initializes Printer UART for receipt printing
+ * 7. Runs LED task for status indication
+ * 8. Runs console task for processing JSON commands
+ *
+ * ============================================================================
+ * DATA FLOW:
+ * ============================================================================
+ * - WM/MA data → UART → JSON → BLE → Mobile App
+ * - Mobile App → BLE → JSON Command → cmd_parser → Action
+ *
+ * ============================================================================
+ * RELATED FILES:
+ * ============================================================================
+ * - ble_spp.c     : BLE communication with mobile app
+ * - cmd_parser.c  : JSON command processing
+ * - wm_uart.c     : Weighing Machine UART driver
+ * - ma_uart.c     : Milk Analyzer UART driver
+ * - printer_uart.c: Thermal Printer driver
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "driver/usb_serial_jtag.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "sdkconfig.h"
+
+// Include WM module if enabled in menuconfig
+#ifdef CONFIG_NCLE_WM_ENABLE
+#include "wm_uart.h"
+#endif
+
+// Include MA module if enabled in menuconfig
+#ifdef CONFIG_NCLE_MA_ENABLE
+#include "ma_uart.h"
+#endif
+
+// Include Printer module if enabled in menuconfig
+#ifdef CONFIG_NCLE_PRINTER_ENABLE
+#include "printer_uart.h"
+#endif
+
+// Include command parser (always needed)
+#include "cmd_parser.h"
+
+// Include BLE SPP module if enabled in menuconfig
+#ifdef CONFIG_BLE_SPP_ENABLED
+#include "ble_spp.h"
+#endif
+
+// Include Battery monitor module if enabled in menuconfig
+#ifdef CONFIG_NCLE_BATTERY_ENABLE
+#include "battery.h"
+#endif
+
+// Include OTA module if enabled in menuconfig
+#ifdef CONFIG_NCLE_OTA_ENABLE
+#include "ota.h"
+#endif
+
+static const char *TAG = "NCLE_MAIN";
+
+// ============================================================================
+// Status LED Configuration (from menuconfig)
+// ============================================================================
+#define STATUS_LED_GPIO     CONFIG_NCLE_STATUS_LED_GPIO
+#ifdef CONFIG_NCLE_STATUS_LED_ACTIVE_HIGH
+#define LED_ON_LEVEL        1   // LED turns ON when GPIO is HIGH
+#define LED_OFF_LEVEL       0   // LED turns OFF when GPIO is LOW
+#else
+#define LED_ON_LEVEL        0   // LED turns ON when GPIO is LOW (inverted)
+#define LED_OFF_LEVEL       1   // LED turns OFF when GPIO is HIGH
+#endif
+
+// LED activity flag - set by WM/MA modules when data is received
+static volatile bool s_led_activity_flag = false;
+
+// ============================================================================
+// BLE Data Callback Wrappers
+// ============================================================================
+#ifdef CONFIG_BLE_SPP_ENABLED
+
+/**
+ * @brief Callback wrapper for WM (Weighing Machine) data to BLE
+ *
+ * ============================================================================
+ * PURPOSE:
+ * ============================================================================
+ * When WM receives weight data from the weighing machine, this function
+ * sends it to the mobile app via BLE.
+ *
+ * ============================================================================
+ * WHY THIS FUNCTION EXISTS:
+ * ============================================================================
+ * WM callback has signature: void (*)(const char*, size_t)
+ * BLE send function needs:   void (*)(const char*, unsigned int)
+ * This wrapper converts size_t to unsigned int.
+ *
+ * ============================================================================
+ * INPUT:
+ * ============================================================================
+ * @param json_data - JSON string containing weight data
+ *                    Example: {"device":"wm","data":"0017.31Kg","model":9001 }
+ * @param len       - Length of the JSON string in bytes
+ *
+ * ============================================================================
+ * OUTPUT:
+ * ============================================================================
+ * Sends data to mobile app via BLE notify characteristic.
+ * Mobile app receives JSON and displays weight to user.
+ *
+ * ============================================================================
+ * DATA FLOW:
+ * ============================================================================
+ * Weighing Machine → UART → wm_uart.c → this callback → BLE → Mobile App
+ */
+static void wm_ble_data_callback(const char *json_data, size_t len)
+{
+    ble_spp_output_callback(json_data, (unsigned int)len);
+}
+
+/**
+ * @brief Callback wrapper for MA (Milk Analyzer) data to BLE
+ *
+ * ============================================================================
+ * PURPOSE:
+ * ============================================================================
+ * When MA receives milk analysis data (receipt with FAT, SNF, etc.),
+ * this function sends it to the mobile app via BLE.
+ *
+ * ============================================================================
+ * WHY THIS FUNCTION EXISTS:
+ * ============================================================================
+ * MA callback has signature: void (*)(const char*, int)
+ * BLE send function needs:   void (*)(const char*, unsigned int)
+ * This wrapper converts int to unsigned int.
+ *
+ * ============================================================================
+ * INPUT:
+ * ============================================================================
+ * @param json_data - JSON string containing milk analysis receipt
+ *                    Example: {"device":"ma","data":"FAT: 4.5%\nSNF: 8.6%...","model":1002 }
+ * @param len       - Length of the JSON string in bytes
+ *
+ * ============================================================================
+ * OUTPUT:
+ * ============================================================================
+ * Sends data to mobile app via BLE notify characteristic.
+ * Mobile app receives JSON and displays milk analysis to user.
+ *
+ * ============================================================================
+ * DATA FLOW:
+ * ============================================================================
+ * Milk Analyzer → UART → ma_uart.c → this callback → BLE → Mobile App
+ */
+static void ma_ble_data_callback(const char *json_data, int len)
+{
+    ble_spp_output_callback(json_data, (unsigned int)len);
+}
+#endif
+
+// ============================================================================
+// LED Activity Callback
+// ============================================================================
+
+/**
+ * @brief Callback function triggered when any device has activity
+ *
+ * ============================================================================
+ * PURPOSE:
+ * ============================================================================
+ * Sets a flag that tells the LED task to blink rapidly.
+ * This provides visual feedback when WM/MA receives data.
+ *
+ * ============================================================================
+ * WHY THIS FUNCTION EXISTS:
+ * ============================================================================
+ * User can see LED blinking and know that data is being received.
+ * - If LED is doing slow heartbeat → waiting for data
+ * - If LED is blinking rapidly → data was just received
+ *
+ * ============================================================================
+ * INPUT:
+ * ============================================================================
+ * None
+ *
+ * ============================================================================
+ * OUTPUT:
+ * ============================================================================
+ * Sets s_led_activity_flag = true
+ * LED task will see this flag and blink rapidly.
+ *
+ * ============================================================================
+ * CALLED BY:
+ * ============================================================================
+ * - wm_uart.c : When weight data is received
+ * - ma_uart.c : When milk analysis data is received
+ */
+static void on_activity(void)
+{
+    s_led_activity_flag = true;
+}
+
+// ============================================================================
+// Status LED Task
+// ============================================================================
+
+/**
+ * @brief FreeRTOS task that controls the status LED
+ *
+ * ============================================================================
+ * PURPOSE:
+ * ============================================================================
+ * Provides visual indication of system status:
+ * - IDLE: Slow heartbeat blink (system is running, waiting for data)
+ * - ACTIVITY: Rapid blink (data is being received/processed)
+ *
+ * ============================================================================
+ * WHY THIS FUNCTION EXISTS:
+ * ============================================================================
+ * User can see at a glance if the device is working and receiving data.
+ * No need to check logs or connect to see status.
+ *
+ * ============================================================================
+ * INPUT:
+ * ============================================================================
+ * @param arg - FreeRTOS task argument (not used, always NULL)
+ *
+ * ============================================================================
+ * OUTPUT:
+ * ============================================================================
+ * Controls GPIO pin connected to LED:
+ * - Sets GPIO HIGH or LOW to turn LED on/off
+ *
+ * ============================================================================
+ * LED BEHAVIOR:
+ * ============================================================================
+ * IDLE (waiting for data):
+ *   - LED ON for 100ms
+ *   - LED OFF for 900ms
+ *   - Repeat forever (slow heartbeat)
+ *
+ * ACTIVITY (data received):
+ *   - LED ON for 100ms, OFF for 100ms
+ *   - Repeat 5 times (rapid blink)
+ *   - Then return to idle heartbeat
+ *
+ * ============================================================================
+ * RUNS:
+ * ============================================================================
+ * Forever in background as FreeRTOS task (never returns)
+ */
+static void led_task(void *arg)
+{
+    // Initialize LED GPIO pin as output
+    gpio_reset_pin(STATUS_LED_GPIO);
+    gpio_set_direction(STATUS_LED_GPIO, GPIO_MODE_OUTPUT);
+
+    ESP_LOGI(TAG, "LED: GPIO%d (active %s)", STATUS_LED_GPIO, LED_ON_LEVEL ? "HIGH" : "LOW");
+
+    while (1) {
+        if (s_led_activity_flag) {
+            // Activity detected - clear flag and blink rapidly 5 times
+            s_led_activity_flag = false;
+
+            for (int i = 0; i < 5; i++) {
+                gpio_set_level(STATUS_LED_GPIO, LED_ON_LEVEL);   // LED ON
+                vTaskDelay(pdMS_TO_TICKS(100));                   // Wait 100ms
+                gpio_set_level(STATUS_LED_GPIO, LED_OFF_LEVEL);  // LED OFF
+                vTaskDelay(pdMS_TO_TICKS(100));                   // Wait 100ms
+            }
+        } else {
+            // Idle - slow heartbeat
+            gpio_set_level(STATUS_LED_GPIO, LED_ON_LEVEL);   // LED ON
+            vTaskDelay(pdMS_TO_TICKS(100));                   // Wait 100ms (short on)
+            gpio_set_level(STATUS_LED_GPIO, LED_OFF_LEVEL);  // LED OFF
+            vTaskDelay(pdMS_TO_TICKS(900));                   // Wait 900ms (long off)
+        }
+    }
+}
+
+// ============================================================================
+// USB Console Functions
+// ============================================================================
+
+#define CMD_BUF_SIZE 1024  // Maximum command buffer size (bytes)
+
+/**
+ * @brief Initialize USB-CDC console for serial communication
+ *
+ * ============================================================================
+ * PURPOSE:
+ * ============================================================================
+ * Sets up USB-CDC (USB Serial) for:
+ * - Debug output (ESP_LOGI, printf, etc.) to PC terminal
+ * - Receiving JSON commands from PC terminal for testing
+ *
+ * ============================================================================
+ * WHY THIS FUNCTION EXISTS:
+ * ============================================================================
+ * Allows developers to:
+ * - See debug logs on PC without special hardware
+ * - Send test commands without needing mobile app
+ * - Debug issues during development
+ *
+ * ============================================================================
+ * INPUT:
+ * ============================================================================
+ * None
+ *
+ * ============================================================================
+ * OUTPUT:
+ * ============================================================================
+ * USB-CDC driver installed and ready for use.
+ * After this, printf() and ESP_LOGI() output will appear on PC terminal.
+ *
+ * ============================================================================
+ * BUFFER SIZES:
+ * ============================================================================
+ * - RX buffer: 512 bytes (commands from PC)
+ * - TX buffer: 512 bytes (logs to PC)
+ */
+static void init_usb_console(void)
+{
+    usb_serial_jtag_driver_config_t config = {
+        .rx_buffer_size = 512,
+        .tx_buffer_size = 512,
+    };
+    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&config));
+}
+
+/**
+ * @brief FreeRTOS task that processes JSON commands from USB console
+ *
+ * ============================================================================
+ * PURPOSE:
+ * ============================================================================
+ * Reads JSON commands typed by user in PC terminal and processes them.
+ * Uses same interface as BLE - allows testing without mobile app.
+ *
+ * ============================================================================
+ * WHY THIS FUNCTION EXISTS:
+ * ============================================================================
+ * - Developers can test commands from PC terminal
+ * - Same JSON format as mobile app uses
+ * - Useful for debugging and factory testing
+ * - No need to connect mobile app for basic testing
+ *
+ * ============================================================================
+ * INPUT:
+ * ============================================================================
+ * @param arg - FreeRTOS task argument (not used, always NULL)
+ *
+ * ============================================================================
+ * OUTPUT:
+ * ============================================================================
+ * Processes commands and sends JSON responses to USB console.
+ * Responses also sent to BLE if connected.
+ *
+ * ============================================================================
+ * COMMAND FORMAT:
+ * ============================================================================
+ * {"command":"command_name","param":"value"}#
+ *
+ * Rules:
+ * - Must be valid JSON starting with '{'
+ * - Terminated by '#' or newline ('\r' or '\n')
+ * - Maximum length: 1024 bytes
+ *
+ * ============================================================================
+ * EXAMPLE:
+ * ============================================================================
+ * User types in terminal:
+ *   {"command":"get_firmware_version"}#
+ *
+ * System responds:
+ *   {"response_message":"get_firmware_version","status_code":0,"data":"2.0.0.1000"}
+ *
+ * ============================================================================
+ * RUNS:
+ * ============================================================================
+ * Forever in background as FreeRTOS task (never returns)
+ */
+static void console_task(void *arg)
+{
+    static char cmd_buf[CMD_BUF_SIZE];  // Buffer to accumulate command characters
+    int cmd_idx = 0;                     // Current position in buffer
+    uint8_t rx_byte;                     // Single received byte
+
+    ESP_LOGI(TAG, "USB Console ready (JSON commands only)");
+    ESP_LOGI(TAG, "Format: {\"command\":\"...\"}#");
+
+    while (1) {
+        // Read one byte from USB with 100ms timeout
+        // Returns 1 if byte received, 0 if timeout
+        int len = usb_serial_jtag_read_bytes(&rx_byte, 1, pdMS_TO_TICKS(100));
+
+        if (len > 0) {
+            char ch = (char)rx_byte;
+
+            // Check for command terminator: '#' or newline
+            if (ch == '#' || ch == '\r' || ch == '\n') {
+                if (cmd_idx > 0) {
+                    // Null-terminate the command string
+                    cmd_buf[cmd_idx] = '\0';
+
+                    // Only process if it looks like JSON (starts with '{')
+                    // Ignores garbage characters or partial commands
+                    if (cmd_buf[0] == '{') {
+                        parse_and_process_commands(cmd_buf, cmd_idx);
+                    }
+                }
+                // Reset buffer for next command
+                cmd_idx = 0;
+                memset(cmd_buf, 0, sizeof(cmd_buf));
+                continue;
+            }
+
+            // Accumulate character into buffer (if space available)
+            if (cmd_idx < CMD_BUF_SIZE - 1) {
+                cmd_buf[cmd_idx++] = ch;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// NVS Initialization
+// ============================================================================
+
+/**
+ * @brief Initialize Non-Volatile Storage (NVS)
+ *
+ * ============================================================================
+ * PURPOSE:
+ * ============================================================================
+ * NVS is flash storage that survives power cycles. Used to store:
+ * - WM configuration (baud rate, model, stream mode)
+ * - MA configuration (baud rate, model)
+ * - Printer configuration (baud rate, parity)
+ *
+ * ============================================================================
+ * WHY THIS FUNCTION EXISTS:
+ * ============================================================================
+ * User configures device once via mobile app, settings are saved to NVS.
+ * On next power-on, device loads saved settings from NVS automatically.
+ * User doesn't need to reconfigure after every power cycle.
+ *
+ * ============================================================================
+ * INPUT:
+ * ============================================================================
+ * None
+ *
+ * ============================================================================
+ * OUTPUT:
+ * ============================================================================
+ * @return ESP_OK if NVS initialized successfully
+ * @return Error code if initialization failed
+ *
+ * ============================================================================
+ * ERROR HANDLING:
+ * ============================================================================
+ * - First boot (no NVS data): Initializes empty NVS
+ * - Corrupted NVS: Erases and reinitializes (loses saved data)
+ * - NVS version mismatch: Erases and reinitializes (after firmware update)
+ */
+static esp_err_t init_nvs(void)
+{
+    esp_err_t ret = nvs_flash_init();
+
+    // Handle corrupted or version mismatch - erase and retry
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS partition erased (corrupted or version mismatch)");
+        ESP_ERROR_CHECK(nvs_flash_erase());  // Erase all NVS data
+        ret = nvs_flash_init();               // Try again with clean NVS
+    }
+    return ret;
+}
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+/**
+ * @brief Main application entry point - called by ESP-IDF after boot
+ *
+ * ============================================================================
+ * PURPOSE:
+ * ============================================================================
+ * This is where everything starts. Initializes all components in the
+ * correct order and starts all background tasks.
+ *
+ * ============================================================================
+ * WHY INITIALIZATION ORDER MATTERS:
+ * ============================================================================
+ * 1. NVS first       - Other components need to load saved configs
+ * 2. USB console     - For debug output during remaining init
+ * 3. Command parser  - Needed before BLE can process commands
+ * 4. WM/MA/Printer   - Hardware interfaces (order doesn't matter)
+ * 5. BLE last        - Registers callbacks to already-initialized modules
+ *
+ * ============================================================================
+ * INPUT:
+ * ============================================================================
+ * None (called by ESP-IDF, not by user code)
+ *
+ * ============================================================================
+ * OUTPUT:
+ * ============================================================================
+ * None (runs forever via FreeRTOS tasks, never returns)
+ *
+ * ============================================================================
+ * INITIALIZATION SEQUENCE:
+ * ============================================================================
+ * 1. Wait 2 seconds   - USB enumeration (PC needs time to detect device)
+ * 2. Initialize NVS   - Persistent storage for configurations
+ * 3. Initialize USB   - Debug output console
+ * 4. Initialize parser- JSON command processing
+ * 5. Start LED task   - Status indication (heartbeat)
+ * 6. Initialize WM    - Weighing machine UART
+ * 7. Initialize MA    - Milk analyzer UART
+ * 8. Initialize Printer- Thermal printer UART
+ * 9. Initialize BLE   - Mobile app connection
+ * 10. Start console   - USB command processing
+ *
+ * ============================================================================
+ * AFTER INIT COMPLETES:
+ * ============================================================================
+ * System is ready. LED shows heartbeat.
+ * Waiting for:
+ * - BLE connection from mobile app (NitaraCLE4)
+ * - WM/MA data from connected dairy devices
+ * - USB commands from PC terminal (for debugging)
+ */
+void app_main(void)
+{
+    // ========================================================================
+    // Step 1: Wait for USB-CDC enumeration
+    // ========================================================================
+    // USB-CDC takes time for host PC to enumerate the device.
+    // If we start logging immediately, first messages are lost.
+    // Wait 2 seconds so user has time to open terminal and see all logs.
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "   NCLite ESP32-S3 Starting...");
+    ESP_LOGI(TAG, "========================================");
+
+    // ========================================================================
+    // Step 2: Initialize NVS (Non-Volatile Storage)
+    // ========================================================================
+    // Must be first - other components load their saved configs from NVS
+    ESP_ERROR_CHECK(init_nvs());
+    ESP_LOGI(TAG, "NVS initialized");
+
+    // ========================================================================
+    // Step 3: Initialize USB console
+    // ========================================================================
+    // Enables debug logging and command input from PC terminal
+    init_usb_console();
+    ESP_LOGI(TAG, "USB console initialized");
+
+    // ========================================================================
+    // Step 4: Initialize command parser
+    // ========================================================================
+    // JSON command processor - needed before BLE or console can work
+    cmd_parser_init();
+    ESP_LOGI(TAG, "Command parser initialized");
+
+    // Brief delay before hardware initialization
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // ========================================================================
+    // Step 5: Start LED task
+    // ========================================================================
+    // Status LED for visual indication (heartbeat when idle, rapid blink on activity)
+    xTaskCreate(led_task, "led", 4096, NULL, 1, NULL);
+
+    // ========================================================================
+    // Step 6: Initialize WM (Weighing Machine) module
+    // ========================================================================
+#ifdef CONFIG_NCLE_WM_ENABLE
+    ESP_LOGI(TAG, "WM Module: Enabled");
+    ESP_ERROR_CHECK(wm_uart_init());             // Initialize UART driver
+    wm_uart_set_activity_callback(on_activity);  // LED blinks when data received
+    ESP_ERROR_CHECK(wm_uart_start());            // Start receive task
+#else
+    ESP_LOGI(TAG, "WM Module: Disabled");
+#endif
+
+    // ========================================================================
+    // Step 7: Initialize MA (Milk Analyzer) module
+    // ========================================================================
+#ifdef CONFIG_NCLE_MA_ENABLE
+    ESP_LOGI(TAG, "MA Module: Enabled");
+    ESP_ERROR_CHECK(ma_uart_init());             // Initialize UART driver
+    ma_uart_set_activity_callback(on_activity);  // LED blinks when data received
+    ESP_ERROR_CHECK(ma_uart_start());            // Start receive task
+#else
+    ESP_LOGI(TAG, "MA Module: Disabled");
+#endif
+
+    // ========================================================================
+    // Step 8: Initialize Printer module
+    // ========================================================================
+#ifdef CONFIG_NCLE_PRINTER_ENABLE
+    ESP_LOGI(TAG, "Printer Module: Enabled");
+    ESP_ERROR_CHECK(printer_uart_init());        // Initialize UART driver
+    // Note: Printer doesn't need start() - it sends when commanded
+#else
+    ESP_LOGI(TAG, "Printer Module: Disabled");
+#endif
+
+    // ========================================================================
+    // Step 8.5: Initialize Battery monitor module
+    // ========================================================================
+#ifdef CONFIG_NCLE_BATTERY_ENABLE
+    ESP_LOGI(TAG, "Battery Module: Enabled (GPIO%d)", BATTERY_ADC_GPIO);
+    esp_err_t batt_ret = battery_init();
+    if (batt_ret == ESP_OK) {
+        ESP_LOGI(TAG, "Battery: %lumV (%d%%)",
+                 battery_get_voltage_mv(), battery_get_percentage());
+    } else {
+        ESP_LOGW(TAG, "Battery Module: Init failed (0x%x)", batt_ret);
+    }
+#else
+    ESP_LOGI(TAG, "Battery Module: Disabled");
+#endif
+
+    // ========================================================================
+    // Step 8.6: Initialize OTA update module
+    // ========================================================================
+#ifdef CONFIG_NCLE_OTA_ENABLE
+    ESP_LOGI(TAG, "OTA Module: Enabled");
+    esp_err_t ota_ret = ota_init();
+    if (ota_ret == ESP_OK) {
+        // Mark current firmware as valid (prevents rollback)
+        ota_mark_valid();
+        char part_label[16];
+        uint32_t part_addr, part_size;
+        ota_get_running_partition_info(part_label, &part_addr, &part_size);
+        ESP_LOGI(TAG, "OTA: Running from %s (0x%lx, %luKB)",
+                 part_label, part_addr, part_size / 1024);
+    } else {
+        ESP_LOGW(TAG, "OTA Module: Init failed (0x%x)", ota_ret);
+    }
+#else
+    ESP_LOGI(TAG, "OTA Module: Disabled");
+#endif
+
+    // ========================================================================
+    // Step 9: Initialize BLE SPP module
+    // ========================================================================
+#ifdef CONFIG_BLE_SPP_ENABLED
+    ESP_LOGI(TAG, "BLE SPP Module: Initializing...");
+    esp_err_t ble_ret = ble_spp_init();
+    if (ble_ret == ESP_OK) {
+        ESP_LOGI(TAG, "BLE SPP Module: Enabled (Device: %s)", ble_spp_get_device_name());
+
+        // Register callback so command responses go to BLE (and USB console)
+        cmd_parser_register_output_callback(ble_spp_output_callback);
+
+        // Register WM data callback - sends weight data to mobile app via BLE
+#ifdef CONFIG_NCLE_WM_ENABLE
+        wm_uart_set_data_callback(wm_ble_data_callback);
+        ESP_LOGI(TAG, "WM -> BLE callback registered");
+#endif
+
+        // Register MA data callback - sends milk data to mobile app via BLE
+#ifdef CONFIG_NCLE_MA_ENABLE
+        ma_uart_set_data_callback(ma_ble_data_callback);
+        ESP_LOGI(TAG, "MA -> BLE callback registered");
+#endif
+    } else {
+        ESP_LOGE(TAG, "BLE SPP Module: Failed to initialize (0x%x)", ble_ret);
+    }
+#else
+    ESP_LOGI(TAG, "BLE SPP Module: Disabled");
+#endif
+
+    // ========================================================================
+    // Step 10: Start console task
+    // ========================================================================
+    // USB command processing - allows testing via PC terminal
+    xTaskCreate(console_task, "console", 8192, NULL, 3, NULL);
+
+    // ========================================================================
+    // Initialization complete
+    // ========================================================================
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "   System Ready - JSON commands only");
+    ESP_LOGI(TAG, "========================================");
+
+    // Log memory status (useful for debugging memory leaks)
+    ESP_LOGI(TAG, "Memory: Free heap: %lu bytes", esp_get_free_heap_size());
+    ESP_LOGI(TAG, "Memory: Min free heap: %lu bytes", esp_get_minimum_free_heap_size());
+
+    // app_main() returns here, but FreeRTOS tasks continue running forever
+}

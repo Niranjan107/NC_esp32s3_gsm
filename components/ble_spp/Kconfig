@@ -1,0 +1,10 @@
+menu "BLE SPP Configuration"
+
+    config BLE_SPP_ENABLED
+        bool "Enable BLE SPP"
+        default y
+        help
+            Enable BLE Serial Port Profile using Nordic UART Service.
+            This allows communication with mobile apps like "Serial Bluetooth Terminal".
+
+endmenu
