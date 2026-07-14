@@ -284,6 +284,31 @@ const char* wm_uart_end_char_to_string(wm_end_char_t end_char);
  */
 int wm_uart_end_char_to_byte(wm_end_char_t end_char);
 
+// ============================================================================
+// Raw byte callback (for validation/diagnostics only - Phase 1 of GSM work)
+// ============================================================================
+
+/**
+ * @brief Raw per-byte callback, invoked for every byte read from the HW UART.
+ *
+ * Used by wm_uart_validator to compare the hardware UART's byte stream against
+ * a parallel RMT-based soft UART running on the same GPIO. When the callback
+ * is NULL (the default), the RX task runs exactly as before with zero overhead.
+ *
+ * @param byte   The received byte
+ * @param ts_us  Timestamp (esp_timer_get_time) captured immediately after
+ *               uart_read_bytes() returned
+ * @param ctx    User context pointer passed to wm_uart_set_raw_byte_callback
+ */
+typedef void (*wm_uart_raw_byte_cb_t)(uint8_t byte, int64_t ts_us, void *ctx);
+
+/**
+ * @brief Register a raw-byte callback. Pass NULL to disable.
+ * @param cb   Callback function (NULL disables)
+ * @param ctx  User context, passed through to cb
+ */
+void wm_uart_set_raw_byte_callback(wm_uart_raw_byte_cb_t cb, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

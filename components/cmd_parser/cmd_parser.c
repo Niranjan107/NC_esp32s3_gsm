@@ -93,6 +93,147 @@
 #include "mbedtls/base64.h"
 #endif
 
+#ifdef CONFIG_NCLE_GSM_ENABLE
+#include "gsm.h"
+#include "gsm_task.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#ifdef CONFIG_NCLE_PRINTER_ENABLE
+#include "printer_uart.h"
+#endif
+
+/* GSM op worker — runs on its own task so BLE callback (BTC_TASK) doesn't
+ * block for 5-25s and so we have enough stack for the AT command chain. */
+typedef enum {
+    GSM_OP_HTTP_POST,
+    GSM_OP_HTTP_GET,
+    GSM_OP_PING,
+    GSM_OP_SEND_TO_PRINT,    /* POST + read response body + print it */
+} gsm_op_t;
+
+typedef struct {
+    gsm_op_t op;
+    char     url_or_host[256];     /* URL for HTTP, host for ping */
+    char     body[512];            /* used for HTTP POST */
+    uint8_t  ping_count;
+    uint16_t ping_timeout_s;
+} gsm_op_req_t;
+
+static void gsm_op_worker_task(void *arg)
+{
+    gsm_op_req_t *req = (gsm_op_req_t *)arg;
+    static char resp_body[256];
+    static char data[320];
+    int http_code = -1;
+    esp_err_t err = ESP_FAIL;
+    const char *resp_msg_ok = "";
+    const char *resp_msg_fail = "";
+
+    switch (req->op) {
+    case GSM_OP_HTTP_POST:
+        err = gsm_http_post(req->url_or_host, req->body, &http_code,
+                            resp_body, sizeof(resp_body));
+        snprintf(data, sizeof(data), "{\"http\":%d,\"resp_len\":%u}",
+                 http_code, (unsigned)strlen(resp_body));
+        resp_msg_ok   = RESP_GSM_HTTP_POST_OK;
+        resp_msg_fail = RESP_GSM_HTTP_POST_FAIL;
+        break;
+
+    case GSM_OP_HTTP_GET:
+        err = gsm_http_get(req->url_or_host, &http_code,
+                           resp_body, sizeof(resp_body));
+        snprintf(data, sizeof(data), "{\"http\":%d,\"resp_len\":%u}",
+                 http_code, (unsigned)strlen(resp_body));
+        resp_msg_ok   = RESP_GSM_HTTP_GET_OK;
+        resp_msg_fail = RESP_GSM_HTTP_GET_FAIL;
+        break;
+
+    case GSM_OP_PING: {
+        gsm_ping_result_t pr = {0};
+        err = gsm_ping(req->url_or_host, req->ping_count, req->ping_timeout_s, &pr);
+        snprintf(data, sizeof(data),
+                 "{\"reachable\":%d,\"sent\":%d,\"recv\":%d,\"loss_pct\":%d,"
+                 "\"rtt_avg\":%d,\"rtt_max\":%d}",
+                 (int)pr.reachable, pr.sent, pr.received, pr.loss_pct,
+                 pr.rtt_avg_ms, pr.rtt_max_ms);
+        resp_msg_ok   = RESP_GSM_PING_OK;
+        resp_msg_fail = RESP_GSM_PING_FAIL;
+        break;
+    }
+
+    case GSM_OP_SEND_TO_PRINT: {
+        /* POST the body to the URL, read response, send response body
+         * straight to the printer. The server controls exactly what gets
+         * printed by what it returns in the HTTP response body. */
+        err = gsm_http_post(req->url_or_host, req->body, &http_code,
+                            resp_body, sizeof(resp_body));
+        bool printed = false;
+        if (err == ESP_OK && http_code >= 200 && http_code < 300 &&
+            strlen(resp_body) > 0) {
+#ifdef CONFIG_NCLE_PRINTER_ENABLE
+            printed = printer_print_with_special_chars(resp_body);
+#endif
+        }
+        snprintf(data, sizeof(data),
+                 "{\"http\":%d,\"resp_len\":%u,\"printed\":%d}",
+                 http_code, (unsigned)strlen(resp_body), (int)printed);
+        resp_msg_ok   = RESP_GSM_SEND_TO_PRINT_OK;
+        resp_msg_fail = RESP_GSM_SEND_TO_PRINT_FAIL;
+        if (err == ESP_OK && !printed) err = ESP_FAIL;
+        break;
+    }
+    }
+
+    send_response(err == ESP_OK ? resp_msg_ok : resp_msg_fail,
+                  err == ESP_OK ? STATUS_OK   : STATUS_ERR, data);
+
+    free(req);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t spawn_op_worker(gsm_op_req_t *req)
+{
+    BaseType_t ok = xTaskCreate(gsm_op_worker_task, "gsm_op_w",
+                                8192, req, 4, NULL);
+    if (ok != pdPASS) {
+        free(req);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t spawn_http_worker(const char *url, const char *body, bool is_post)
+{
+    gsm_op_req_t *req = (gsm_op_req_t *)calloc(1, sizeof(*req));
+    if (req == NULL) return ESP_ERR_NO_MEM;
+    req->op = is_post ? GSM_OP_HTTP_POST : GSM_OP_HTTP_GET;
+    strncpy(req->url_or_host, url, sizeof(req->url_or_host) - 1);
+    if (body) strncpy(req->body, body, sizeof(req->body) - 1);
+    return spawn_op_worker(req);
+}
+
+static esp_err_t spawn_ping_worker(const char *host, uint8_t count, uint16_t timeout_s)
+{
+    gsm_op_req_t *req = (gsm_op_req_t *)calloc(1, sizeof(*req));
+    if (req == NULL) return ESP_ERR_NO_MEM;
+    req->op = GSM_OP_PING;
+    if (host) strncpy(req->url_or_host, host, sizeof(req->url_or_host) - 1);
+    req->ping_count     = count;
+    req->ping_timeout_s = timeout_s;
+    return spawn_op_worker(req);
+}
+
+static esp_err_t spawn_print_worker(const char *url, const char *body)
+{
+    gsm_op_req_t *req = (gsm_op_req_t *)calloc(1, sizeof(*req));
+    if (req == NULL) return ESP_ERR_NO_MEM;
+    req->op = GSM_OP_SEND_TO_PRINT;
+    strncpy(req->url_or_host, url, sizeof(req->url_or_host) - 1);
+    if (body) strncpy(req->body, body, sizeof(req->body) - 1);
+    return spawn_op_worker(req);
+}
+#endif
+
 static const char *TAG = "CMD_PARSER";
 
 /*******************************************************************************
@@ -504,6 +645,176 @@ void parse_and_process_commands(char *json_str, int json_len)
         send_response("ota_status", STATUS_OK, ota_resp);
 #else
         send_response("ota_not_enabled", STATUS_ERR, NULL);
+#endif
+    }
+    /*-------------------------------------------------------------------------
+     * GSM Commands
+     * gsm_enable  : start the GSM task (init modem, begin status polling)
+     * gsm_disable : stop the GSM task (power off modem)
+     * gsm_status  : return cached status snapshot (alive/registered/rssi/bars/net)
+     *-----------------------------------------------------------------------*/
+    else if (strcmp(cmd, CMD_GSM_ENABLE) == 0) {
+#ifdef CONFIG_NCLE_GSM_ENABLE
+        esp_err_t err = gsm_task_start();
+        send_response(err == ESP_OK ? RESP_GSM_ENABLE_STARTED
+                                    : RESP_GSM_ENABLE_FAILED,
+                      err == ESP_OK ? STATUS_OK : STATUS_ERR, NULL);
+#else
+        send_response(RESP_GSM_NOT_ENABLED, STATUS_ERR, NULL);
+#endif
+    }
+    else if (strcmp(cmd, CMD_GSM_DISABLE) == 0) {
+#ifdef CONFIG_NCLE_GSM_ENABLE
+        gsm_task_stop();
+        send_response(RESP_GSM_DISABLE_STOPPED, STATUS_OK, NULL);
+#else
+        send_response(RESP_GSM_NOT_ENABLED, STATUS_ERR, NULL);
+#endif
+    }
+    else if (strcmp(cmd, CMD_GSM_STATUS) == 0) {
+#ifdef CONFIG_NCLE_GSM_ENABLE
+        gsm_status_t s;
+        gsm_task_get_last_status(&s);
+        static char gsm_resp[160];
+        snprintf(gsm_resp, sizeof(gsm_resp),
+                 "{\"alive\":%d,\"registered\":%d,\"rssi\":%d,\"bars\":%d,\"net\":%d}",
+                 s.alive, s.registered, s.rssi, s.bars, (int)s.net_status);
+        send_response(RESP_GSM_STATUS_OK, STATUS_OK, gsm_resp);
+#else
+        send_response(RESP_GSM_NOT_ENABLED, STATUS_ERR, NULL);
+#endif
+    }
+    /*-------------------------------------------------------------------------
+     * GSM HTTP POST  (testing/verification command)
+     * Usage: {"command":"gsm_http_post","url":"https://...","body":"<json>"}
+     * Response data: {"http":<code>,"resp":"<server reply, truncated>"}
+     *
+     * Requires gsm_task to be running and modem registered.
+     *-----------------------------------------------------------------------*/
+    else if (strcmp(cmd, CMD_GSM_HTTP_POST) == 0) {
+#ifdef CONFIG_NCLE_GSM_ENABLE
+        cJSON *url_item  = cJSON_GetObjectItem(root, "url");
+        cJSON *body_item = cJSON_GetObjectItem(root, "body");
+        if (!url_item || !cJSON_IsString(url_item)) {
+            send_response(RESP_GSM_HTTP_POST_FAIL, STATUS_ERR, "\"missing url\"");
+        } else {
+            const char *url  = url_item->valuestring;
+            const char *body = (body_item && cJSON_IsString(body_item)) ? body_item->valuestring : "";
+            esp_err_t serr = spawn_http_worker(url, body, true);
+            if (serr == ESP_OK) {
+                /* Ack immediately. Real result follows asynchronously
+                 * once the worker task finishes the HTTP roundtrip. */
+                send_response("gsm_http_post_queued", STATUS_OK, NULL);
+            } else {
+                send_response(RESP_GSM_HTTP_POST_FAIL, STATUS_ERR, "\"spawn failed\"");
+            }
+        }
+#else
+        send_response(RESP_GSM_NOT_ENABLED, STATUS_ERR, NULL);
+#endif
+    }
+    else if (strcmp(cmd, CMD_GSM_HTTP_GET) == 0) {
+#ifdef CONFIG_NCLE_GSM_ENABLE
+        cJSON *url_item = cJSON_GetObjectItem(root, "url");
+        if (!url_item || !cJSON_IsString(url_item)) {
+            send_response(RESP_GSM_HTTP_GET_FAIL, STATUS_ERR, "\"missing url\"");
+        } else {
+            const char *url = url_item->valuestring;
+            esp_err_t serr = spawn_http_worker(url, NULL, false);
+            if (serr == ESP_OK) {
+                send_response("gsm_http_get_queued", STATUS_OK, NULL);
+            } else {
+                send_response(RESP_GSM_HTTP_GET_FAIL, STATUS_ERR, "\"spawn failed\"");
+            }
+        }
+#else
+        send_response(RESP_GSM_NOT_ENABLED, STATUS_ERR, NULL);
+#endif
+    }
+    /*-------------------------------------------------------------------------
+     * GSM Ping (verify data plan is actually working — IP-level reachability)
+     * Usage: {"command":"gsm_ping"}                       (defaults: 8.8.8.8, 4 pings)
+     *        {"command":"gsm_ping","host":"1.1.1.1"}
+     *        {"command":"gsm_ping","host":"...","count":4,"timeout":5}
+     * Response: {"reachable":1,"sent":4,"recv":4,"loss_pct":0,"rtt_avg":53,"rtt_max":57}
+     *-----------------------------------------------------------------------*/
+    /*-------------------------------------------------------------------------
+     * GSM Get Phone Number  (reads SIM MSISDN via AT+CNUM, plus ICCID)
+     * Usage: {"command":"gsm_get_number"}
+     * Response data: {"number":"+918...","iccid":"8991..."}
+     *
+     * Note: many SIMs do not have MSISDN provisioned; "number" may be empty.
+     * ICCID (SIM serial) is always available.
+     *-----------------------------------------------------------------------*/
+    else if (strcmp(cmd, CMD_GSM_GET_NUMBER) == 0) {
+#ifdef CONFIG_NCLE_GSM_ENABLE
+        char number[32] = {0};
+        char iccid[32]  = {0};
+        esp_err_t nerr = gsm_get_phone_number(number, sizeof(number));
+        esp_err_t ierr = gsm_get_iccid(iccid, sizeof(iccid));
+        static char data[128];
+        snprintf(data, sizeof(data),
+                 "{\"number\":\"%s\",\"iccid\":\"%s\"}",
+                 (nerr == ESP_OK) ? number : "",
+                 (ierr == ESP_OK) ? iccid  : "");
+        /* Success if we got at least the ICCID — number is optional */
+        bool ok = (ierr == ESP_OK) || (nerr == ESP_OK);
+        send_response(ok ? RESP_GSM_GET_NUMBER_OK : RESP_GSM_GET_NUMBER_FAIL,
+                      ok ? STATUS_OK : STATUS_ERR, data);
+#else
+        send_response(RESP_GSM_NOT_ENABLED, STATUS_ERR, NULL);
+#endif
+    }
+    /*-------------------------------------------------------------------------
+     * GSM Send-to-Print  (full IoT round-trip: POST data, print response)
+     * Usage: {"command":"gsm_send_to_print","url":"https://your-aws-endpoint/receipt","body":"{\"weight\":\"1.225\",\"fat\":\"4.1\"}"}
+     *
+     * Behavior:
+     *   1. POST <body> to <url> over HTTPS
+     *   2. Read HTTP response body
+     *   3. Send response body raw to printer (server controls what gets printed)
+     *
+     * Response: {"http":<code>,"resp_len":<bytes>,"printed":<0|1>}
+     *-----------------------------------------------------------------------*/
+    else if (strcmp(cmd, CMD_GSM_SEND_TO_PRINT) == 0) {
+#ifdef CONFIG_NCLE_GSM_ENABLE
+        cJSON *url_item  = cJSON_GetObjectItem(root, "url");
+        cJSON *body_item = cJSON_GetObjectItem(root, "body");
+        if (!url_item || !cJSON_IsString(url_item)) {
+            send_response(RESP_GSM_SEND_TO_PRINT_FAIL, STATUS_ERR, "\"missing url\"");
+        } else {
+            const char *url  = url_item->valuestring;
+            const char *body = (body_item && cJSON_IsString(body_item)) ? body_item->valuestring : "";
+            esp_err_t serr = spawn_print_worker(url, body);
+            if (serr == ESP_OK) {
+                send_response("gsm_send_to_print_queued", STATUS_OK, NULL);
+            } else {
+                send_response(RESP_GSM_SEND_TO_PRINT_FAIL, STATUS_ERR, "\"spawn failed\"");
+            }
+        }
+#else
+        send_response(RESP_GSM_NOT_ENABLED, STATUS_ERR, NULL);
+#endif
+    }
+    else if (strcmp(cmd, CMD_GSM_PING) == 0) {
+#ifdef CONFIG_NCLE_GSM_ENABLE
+        cJSON *host_item    = cJSON_GetObjectItem(root, "host");
+        cJSON *count_item   = cJSON_GetObjectItem(root, "count");
+        cJSON *timeout_item = cJSON_GetObjectItem(root, "timeout");
+        const char *host    = (host_item && cJSON_IsString(host_item))
+                              ? host_item->valuestring : "8.8.8.8";
+        uint8_t  count      = (count_item && cJSON_IsNumber(count_item))
+                              ? (uint8_t)count_item->valueint : 4;
+        uint16_t timeout_s  = (timeout_item && cJSON_IsNumber(timeout_item))
+                              ? (uint16_t)timeout_item->valueint : 5;
+        esp_err_t serr = spawn_ping_worker(host, count, timeout_s);
+        if (serr == ESP_OK) {
+            send_response("gsm_ping_queued", STATUS_OK, NULL);
+        } else {
+            send_response(RESP_GSM_PING_FAIL, STATUS_ERR, "\"spawn failed\"");
+        }
+#else
+        send_response(RESP_GSM_NOT_ENABLED, STATUS_ERR, NULL);
 #endif
     }
     else {

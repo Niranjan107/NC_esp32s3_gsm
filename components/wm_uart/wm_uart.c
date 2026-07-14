@@ -87,6 +87,10 @@
 #include <strings.h>
 #include <stdio.h>
 
+#ifdef CONFIG_NCLE_WM_USE_SOFT_UART
+#include "soft_uart_rmt.h"
+#endif
+
 static const char *TAG = "WM_UART";
 
 // ============================================================================
@@ -138,6 +142,7 @@ static char s_last_reading[256];        // Last processed value for comparison
  * Handles WMs that don't send proper line terminators.
  */
 #define WM_RX_TIMEOUT_US    (WM_RX_TIMEOUT_MS * 1000)
+
 static int64_t s_last_rx_time = 0;      // Timestamp of last received byte
 
 /** Statistics for debugging and status display */
@@ -149,6 +154,21 @@ static wm_stats_t s_stats = {0};
  */
 static TaskHandle_t s_rx_task_handle = NULL;
 static volatile bool s_task_running = false;
+
+#ifdef CONFIG_NCLE_WM_USE_SOFT_UART
+static soft_uart_rmt_handle_t s_soft_uart_handle = NULL;
+#endif
+
+/* Raw-byte callback (NULL = disabled, zero overhead path).
+ * Used by wm_uart_validator during Phase 1 soft-UART validation. */
+static wm_uart_raw_byte_cb_t s_raw_byte_cb  = NULL;
+static void                 *s_raw_byte_ctx = NULL;
+
+void wm_uart_set_raw_byte_callback(wm_uart_raw_byte_cb_t cb, void *ctx)
+{
+    s_raw_byte_cb  = cb;
+    s_raw_byte_ctx = ctx;
+}
 
 /**
  * Callbacks for Data and Activity
@@ -424,6 +444,7 @@ static void process_wm_packet(void)
     s_stats.packet_count++;
 
     // =========================================================================
+    // =========================================================================
     // SINGLE-READ MODE (stream=0): Wait for duplicate, output once, stop
     // Matches Pico2W behavior: waits for same value twice (stable reading)
     // =========================================================================
@@ -477,6 +498,73 @@ static void process_wm_packet(void)
 }
 
 /**
+ * @brief Process one received byte through the WM packet parser.
+ *
+ * Shared by the HW UART RX task and (when CONFIG_NCLE_WM_USE_SOFT_UART is
+ * enabled) the soft-UART byte callback. The source of the byte doesn't matter
+ * to the parser - it runs the same end-char detection, printable filter, and
+ * packet-close logic for both paths.
+ */
+static void wm_uart_process_byte(uint8_t byte, int64_t ts_us)
+{
+    s_last_rx_time = ts_us;
+
+    if (s_raw_byte_cb) {
+        s_raw_byte_cb(byte, ts_us, s_raw_byte_ctx);
+    }
+
+    if (is_end_char(byte)) {
+        process_wm_packet();
+    } else if (is_printable_byte(byte)) {
+        if (s_rx_index < sizeof(s_rx_buffer) - 1) {
+            s_rx_buffer[s_rx_index++] = (char)byte;
+        }
+    } else {
+        s_stats.filtered_bytes++;
+    }
+}
+
+#ifdef CONFIG_NCLE_WM_USE_SOFT_UART
+/**
+ * @brief Soft UART byte callback - converts each decoded byte into a
+ * wm_uart_process_byte() call, same way the HW RX task does.
+ */
+static void wm_soft_uart_byte_cb(const soft_uart_rmt_rx_t *rx, void *ctx)
+{
+    (void)ctx;
+    /* Skip frames with invalid start/stop bits (line noise). */
+    if (rx->frame_err) return;
+    wm_uart_process_byte(rx->byte, rx->ts_us);
+}
+
+/**
+ * @brief Timeout monitor for soft-UART mode.
+ *
+ * In HW-UART mode the RX task loop naturally polls for timeouts on every
+ * iteration. With the soft UART we receive bytes via async callbacks, so
+ * we need a small periodic task to check for "no byte for WM_RX_TIMEOUT_MS"
+ * and flush any accumulated buffer as a packet.
+ */
+static void wm_soft_timeout_task(void *arg)
+{
+    ESP_LOGI(TAG, "Soft UART timeout task started - EndChar=%s, Timeout=%dms",
+             wm_uart_end_char_to_string(s_end_char), WM_RX_TIMEOUT_MS);
+    while (s_task_running) {
+        if (s_rx_index > 0 && s_last_rx_time > 0) {
+            int64_t now = esp_timer_get_time();
+            if ((now - s_last_rx_time) >= WM_RX_TIMEOUT_US) {
+                ESP_LOGI(TAG, "Timeout - processing %d bytes", (int)s_rx_index);
+                process_wm_packet();
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    ESP_LOGI(TAG, "Soft UART timeout task stopped");
+    vTaskDelete(NULL);
+}
+#endif /* CONFIG_NCLE_WM_USE_SOFT_UART */
+
+/**
  * @brief UART RX Task
  */
 static void uart_rx_task(void *arg)
@@ -499,25 +587,11 @@ static void uart_rx_task(void *arg)
         }
 
         if (len > 0) {
-            s_last_rx_time = esp_timer_get_time();
-
+            /* All bytes in one uart_read_bytes chunk share approximately
+             * the same arrival timestamp. */
+            int64_t chunk_ts = esp_timer_get_time();
             for (int i = 0; i < len; i++) {
-                uint8_t byte = rx_buffer[i];
-
-                // Check if this is the configured end character
-                if (is_end_char(byte)) {
-                    process_wm_packet();
-                }
-                // Printable character - add to buffer
-                else if (is_printable_byte(byte)) {
-                    if (s_rx_index < sizeof(s_rx_buffer) - 1) {
-                        s_rx_buffer[s_rx_index++] = (char)byte;
-                    }
-                }
-                // Non-printable - filter out (unless it's being buffered for NONE mode)
-                else {
-                    s_stats.filtered_bytes++;
-                }
+                wm_uart_process_byte(rx_buffer[i], chunk_ts);
             }
         }
 
@@ -614,6 +688,27 @@ esp_err_t wm_uart_init(void)
         config_exists = false;
     }
 
+#ifdef CONFIG_NCLE_WM_USE_SOFT_UART
+    /* Soft UART path: skip hardware UART driver install; init RMT-based
+     * software UART on the configured RX GPIO. The hardware UART
+     * peripheral (UART0 by default) remains free for other use. */
+    soft_uart_rmt_config_t sw_cfg = {
+        .gpio_num  = s_config.rx_pin,
+        .baud_rate = s_config.baud_rate,
+        .data_bits = 8,
+        .stop_bits = 1,
+        .parity    = 0,
+    };
+    esp_err_t sw_err = soft_uart_rmt_init(&sw_cfg, &s_soft_uart_handle);
+    if (sw_err != ESP_OK) {
+        ESP_LOGE(TAG, "soft_uart_rmt_init failed: %d", sw_err);
+        return sw_err;
+    }
+    soft_uart_rmt_register_byte_cb(s_soft_uart_handle, wm_soft_uart_byte_cb, NULL);
+    s_initialized = true;
+    ESP_LOGI(TAG, "Initialized: SOFT-UART RX=%d Baud=%d (UART peripheral unused)",
+             s_config.rx_pin, s_config.baud_rate);
+#else
     // Configure UART
     uart_config_t uart_config = {
         .baud_rate = s_config.baud_rate,
@@ -642,6 +737,7 @@ esp_err_t wm_uart_init(void)
              s_config.uart_num, s_config.rx_pin,
              s_config.baud_rate, s_config.parity);
 #endif
+#endif /* CONFIG_NCLE_WM_USE_SOFT_UART */
 
     // Save defaults on first boot (when no config exists in NVS)
     if (!config_exists) {
@@ -657,7 +753,14 @@ esp_err_t wm_uart_deinit(void)
     if (!s_initialized) return ESP_OK;
 
     wm_uart_stop();
+#ifdef CONFIG_NCLE_WM_USE_SOFT_UART
+    if (s_soft_uart_handle) {
+        soft_uart_rmt_deinit(s_soft_uart_handle);
+        s_soft_uart_handle = NULL;
+    }
+#else
     uart_driver_delete(s_config.uart_num);
+#endif
     s_initialized = false;
 
     ESP_LOGI(TAG, "Deinitialized");
@@ -693,6 +796,26 @@ esp_err_t wm_uart_start(void)
     s_rx_index = 0;
     s_last_rx_time = 0;
 
+#ifdef CONFIG_NCLE_WM_USE_SOFT_UART
+    /* Soft UART path: start the RMT receiver + the timeout-monitor task. */
+    s_task_running = true;
+    esp_err_t sw_err = soft_uart_rmt_start(s_soft_uart_handle);
+    if (sw_err != ESP_OK) {
+        s_task_running = false;
+        ESP_LOGE(TAG, "soft_uart_rmt_start failed: %d", sw_err);
+        return sw_err;
+    }
+    BaseType_t ret = xTaskCreate(wm_soft_timeout_task, "wm_uart_rx",
+                                 3072, NULL, 5, &s_rx_task_handle);
+    if (ret != pdPASS) {
+        s_task_running = false;
+        soft_uart_rmt_stop(s_soft_uart_handle);
+        ESP_LOGE(TAG, "Failed to create soft-UART timeout task");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "WM RX (soft UART) started - ready to receive (stream=%d)", s_stream_mode);
+    return ESP_OK;
+#else
     // Flush UART buffers
     uart_flush_input(s_config.uart_num);
 
@@ -707,6 +830,7 @@ esp_err_t wm_uart_start(void)
 
     ESP_LOGI(TAG, "WM RX task created - ready to receive (stream=%d)", s_stream_mode);
     return ESP_OK;
+#endif
 }
 
 void wm_uart_stop(void)
@@ -725,6 +849,11 @@ void wm_uart_stop(void)
         // Note: Task deletes itself via vTaskDelete(NULL)
         // We just clear the handle here
     }
+#ifdef CONFIG_NCLE_WM_USE_SOFT_UART
+    if (s_soft_uart_handle) {
+        soft_uart_rmt_stop(s_soft_uart_handle);
+    }
+#endif
     ESP_LOGI(TAG, "WM stopped - ready for next customer");
 }
 
@@ -734,13 +863,20 @@ esp_err_t wm_uart_set_baud(int new_baud)
 
     ESP_LOGI(TAG, "Changing baud: %d -> %d", s_config.baud_rate, new_baud);
 
-    // Flush buffers
-    uart_flush(s_config.uart_num);
-    uart_flush_input(s_config.uart_num);
-
     // Clear software buffer
     s_rx_index = 0;
     memset(s_rx_buffer, 0, sizeof(s_rx_buffer));
+
+#ifdef CONFIG_NCLE_WM_USE_SOFT_UART
+    esp_err_t ret = soft_uart_rmt_set_baud(s_soft_uart_handle, new_baud);
+    if (ret == ESP_OK) {
+        s_config.baud_rate = new_baud;
+        ESP_LOGI(TAG, "Soft UART baud changed to %d", new_baud);
+    }
+#else
+    // Flush buffers
+    uart_flush(s_config.uart_num);
+    uart_flush_input(s_config.uart_num);
 
     // Reconfigure
     uart_config_t uart_config = {
@@ -762,6 +898,7 @@ esp_err_t wm_uart_set_baud(int new_baud)
 
         ESP_LOGI(TAG, "Baud changed to %d", new_baud);
     }
+#endif
 
     return ret;
 }

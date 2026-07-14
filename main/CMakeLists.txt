@@ -12,4 +12,6 @@ idf_component_register(
         cmd_parser
         printer_uart
         ble_spp
+        soft_uart_rmt
+        wm_uart_validator
 )

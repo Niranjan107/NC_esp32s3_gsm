@@ -1,0 +1,40 @@
+menu "WM UART Validator (Phase 1 only)"
+
+    config NCLE_WM_VALIDATOR_ENABLE
+        bool "Enable WM UART Validator"
+        default n
+        depends on NCLE_WM_ENABLE
+        help
+            Phase 1 validation harness. Runs the RMT-based soft UART in
+            parallel with the hardware WM UART on the same GPIO and
+            compares byte streams. Disable for production.
+
+    config NCLE_WM_VALIDATOR_RMT_CHANNEL
+        int "RMT channel for soft UART"
+        default 0
+        range 0 3
+        depends on NCLE_WM_VALIDATOR_ENABLE
+
+    config NCLE_WM_VALIDATOR_REPORT_INTERVAL_MS
+        int "Stats report interval (ms)"
+        default 10000
+        range 1000 60000
+        depends on NCLE_WM_VALIDATOR_ENABLE
+
+    config NCLE_WM_VALIDATOR_PACKET_QUIET_MS
+        int "Packet end quiet-time (ms)"
+        default 50
+        range 10 500
+        depends on NCLE_WM_VALIDATOR_ENABLE
+
+    config NCLE_WM_VALIDATOR_RUN_SWEEP
+        bool "Run baud sweep on boot (Phase 1.5)"
+        default n
+        depends on NCLE_WM_VALIDATOR_ENABLE
+
+    config NCLE_WM_VALIDATOR_SWEEP_SECONDS_PER_STEP
+        int "Seconds per sweep step"
+        default 600
+        range 30 3600
+        depends on NCLE_WM_VALIDATOR_RUN_SWEEP
+endmenu

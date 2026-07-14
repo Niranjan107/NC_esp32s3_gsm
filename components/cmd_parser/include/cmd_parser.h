@@ -42,6 +42,17 @@ extern "C" {
 #define CMD_SELF_DIAGNOSIS      "self_diagnosis"
 #define CMD_GET_BATTERY_STATUS  "get_battery_status"
 
+// GSM commands (only meaningful when CONFIG_NCLE_GSM_ENABLE=y)
+#define CMD_GSM_ENABLE          "gsm_enable"
+#define CMD_GSM_DISABLE         "gsm_disable"
+#define CMD_GSM_STATUS          "gsm_status"
+#define CMD_GSM_HTTP_POST       "gsm_http_post"
+#define CMD_GSM_HTTP_GET        "gsm_http_get"
+#define CMD_GSM_PING            "gsm_ping"
+#define CMD_GSM_GET_NUMBER      "gsm_get_number"
+#define CMD_GSM_SEND_TO_PRINT   "gsm_send_to_print" /* POST + print response (existing) */
+#define CMD_GSM_FETCH_PRINT     "gsm_fetch_print"   /* GET from server, print response */
+
 /*******************************************************************************
  * Config Parameter Keys
  ******************************************************************************/
@@ -73,6 +84,23 @@ extern "C" {
 #define RESP_INVALID_JSON               "invalid_json_string"
 #define RESP_COMMAND_NOT_FOUND          "command_not_found"
 #define RESP_UNDEFINED_COMMAND          "undefined_command"
+
+// GSM responses
+#define RESP_GSM_ENABLE_STARTED         "gsm_enable_started"
+#define RESP_GSM_ENABLE_FAILED          "gsm_enable_failed"
+#define RESP_GSM_DISABLE_STOPPED        "gsm_disable_stopped"
+#define RESP_GSM_NOT_ENABLED            "gsm_not_enabled"
+#define RESP_GSM_STATUS_OK              "gsm_status"
+#define RESP_GSM_HTTP_POST_OK           "gsm_http_post"
+#define RESP_GSM_HTTP_POST_FAIL         "gsm_http_post_fail"
+#define RESP_GSM_HTTP_GET_OK            "gsm_http_get"
+#define RESP_GSM_HTTP_GET_FAIL          "gsm_http_get_fail"
+#define RESP_GSM_PING_OK                "gsm_ping"
+#define RESP_GSM_PING_FAIL              "gsm_ping_fail"
+#define RESP_GSM_GET_NUMBER_OK          "gsm_get_number"
+#define RESP_GSM_GET_NUMBER_FAIL        "gsm_get_number_fail"
+#define RESP_GSM_SEND_TO_PRINT_OK       "gsm_send_to_print"
+#define RESP_GSM_SEND_TO_PRINT_FAIL     "gsm_send_to_print_fail"
 
 /*******************************************************************************
  * Type Definitions

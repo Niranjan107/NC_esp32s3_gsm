@@ -79,7 +79,137 @@
 #include "ota.h"
 #endif
 
+// Include GSM module if enabled in menuconfig
+#ifdef CONFIG_NCLE_GSM_ENABLE
+#include "gsm.h"
+#include "gsm_task.h"
+#endif
+
+#ifdef CONFIG_NCLE_SOFT_UART_LOOPBACK_TEST
+#include "soft_uart_rmt.h"
+#include "driver/gpio.h"
+#include "esp_rom_sys.h"
+#endif
+
+#ifdef CONFIG_NCLE_WM_VALIDATOR_ENABLE
+#include "wm_uart_validator.h"
+#endif
+
 static const char *TAG = "NCLE_MAIN";
+
+// ============================================================================
+// Soft UART Loopback Smoke Test (Phase 1 development only)
+// ============================================================================
+#ifdef CONFIG_NCLE_SOFT_UART_LOOPBACK_TEST
+static volatile int s_loopback_rx_count = 0;
+static char s_loopback_rx_buf[32];
+
+static void loopback_byte_cb(const soft_uart_rmt_rx_t *rx, void *ctx)
+{
+    (void)ctx;
+    if (s_loopback_rx_count < (int)sizeof(s_loopback_rx_buf) - 1) {
+        s_loopback_rx_buf[s_loopback_rx_count++] = (char)rx->byte;
+        s_loopback_rx_buf[s_loopback_rx_count] = '\0';
+    }
+}
+
+static void bitbang_byte(int gpio, uint8_t b, int bit_us)
+{
+    gpio_set_level(gpio, 0); esp_rom_delay_us(bit_us);            // start
+    for (int i = 0; i < 8; i++) {
+        gpio_set_level(gpio, (b >> i) & 1); esp_rom_delay_us(bit_us);
+    }
+    gpio_set_level(gpio, 1); esp_rom_delay_us(bit_us);            // stop
+}
+
+static void run_loopback_test(void)
+{
+    const int tx_gpio = CONFIG_NCLE_SOFT_UART_LOOPBACK_TX_GPIO;
+    const int rx_gpio = CONFIG_NCLE_SOFT_UART_LOOPBACK_RX_GPIO;
+    const int baud = 9600;
+    const int bit_us = 1000000 / baud; // 104
+
+    ESP_LOGI(TAG, "LOOPBACK: jumper required from GPIO %d -> GPIO %d", tx_gpio, rx_gpio);
+
+    // Configure TX as output
+    gpio_config_t cfg_tx = {
+        .pin_bit_mask = 1ULL << tx_gpio,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg_tx);
+    gpio_set_level(tx_gpio, 1); // idle high
+
+    // ------- PRE-TEST WIRE CHECK (plain GPIO) -------
+    // Temporarily drive TX and read RX as GPIO to verify the jumper wire.
+    gpio_config_t cfg_rx_in = {
+        .pin_bit_mask = 1ULL << rx_gpio,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg_rx_in);
+
+    gpio_set_level(tx_gpio, 0);
+    esp_rom_delay_us(2000);
+    int read_when_low  = gpio_get_level(rx_gpio);
+    gpio_set_level(tx_gpio, 1);
+    esp_rom_delay_us(2000);
+    int read_when_high = gpio_get_level(rx_gpio);
+    ESP_LOGI(TAG, "LOOPBACK: jumper check: TX=LOW -> RX=%d, TX=HIGH -> RX=%d  (want 0, 1)",
+             read_when_low, read_when_high);
+
+    if (read_when_low != 0 || read_when_high != 1) {
+        ESP_LOGE(TAG, "LOOPBACK: *** WIRE-CHECK FAIL *** jumper not conducting between GPIO %d and GPIO %d. Aborting test.",
+                 tx_gpio, rx_gpio);
+        gpio_reset_pin(tx_gpio);
+        gpio_reset_pin(rx_gpio);
+        return;
+    }
+    ESP_LOGI(TAG, "LOOPBACK: jumper check OK");
+
+    // Release RX pin so the RMT driver can claim it
+    gpio_reset_pin(rx_gpio);
+
+    soft_uart_rmt_config_t ucfg = {
+        .gpio_num = rx_gpio, .baud_rate = baud, .data_bits = 8,
+        .stop_bits = 1, .parity = 0,
+    };
+    soft_uart_rmt_handle_t h = NULL;
+    ESP_ERROR_CHECK(soft_uart_rmt_init(&ucfg, &h));
+    ESP_ERROR_CHECK(soft_uart_rmt_register_byte_cb(h, loopback_byte_cb, NULL));
+    ESP_ERROR_CHECK(soft_uart_rmt_start(h));
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    const char *msg = "HELLO\n";
+    ESP_LOGI(TAG, "LOOPBACK: sending '%s' on GPIO %d", msg, tx_gpio);
+    for (const char *p = msg; *p; p++) {
+        bitbang_byte(tx_gpio, (uint8_t)*p, bit_us);
+        esp_rom_delay_us(bit_us);
+    }
+
+    /* Give plenty of time for partial-rx batches + diagnostic logs to appear */
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    ESP_LOGI(TAG, "LOOPBACK: received %d bytes: '%s'",
+             s_loopback_rx_count, s_loopback_rx_buf);
+
+    if (s_loopback_rx_count == (int)strlen(msg) &&
+        strncmp(s_loopback_rx_buf, msg, strlen(msg)) == 0) {
+        ESP_LOGI(TAG, "LOOPBACK: *** PASS ***");
+    } else {
+        ESP_LOGE(TAG, "LOOPBACK: *** FAIL *** (expected '%s')", msg);
+    }
+
+    soft_uart_rmt_stop(h);
+    soft_uart_rmt_deinit(h);
+    gpio_reset_pin(tx_gpio);
+}
+#endif
 
 // ============================================================================
 // Status LED Configuration (from menuconfig)
@@ -139,6 +269,25 @@ static void wm_ble_data_callback(const char *json_data, size_t len)
 {
     ble_spp_output_callback(json_data, (unsigned int)len);
 }
+
+#ifdef CONFIG_NCLE_GSM_ENABLE
+/**
+ * @brief Status callback wired to BLE TX
+ * Fires once per gsm_task poll interval (default 10s).
+ */
+static void gsm_ble_status_callback(const gsm_status_t *s, void *ctx)
+{
+    (void)ctx;
+    static char buf[160];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"device\":\"gsm\",\"alive\":%d,\"registered\":%d,"
+        "\"rssi\":%d,\"bars\":%d,\"net\":%d}\n",
+        s->alive, s->registered, s->rssi, s->bars, (int)s->net_status);
+    if (n > 0 && n < (int)sizeof(buf)) {
+        ble_spp_output_callback(buf, (unsigned int)n);
+    }
+}
+#endif
 
 /**
  * @brief Callback wrapper for MA (Milk Analyzer) data to BLE
@@ -598,15 +747,62 @@ void app_main(void)
     xTaskCreate(led_task, "led", 4096, NULL, 1, NULL);
 
     // ========================================================================
+    // Step 5b: Soft UART loopback smoke test (Phase 1 dev only, Kconfig-gated)
+    // ========================================================================
+#ifdef CONFIG_NCLE_SOFT_UART_LOOPBACK_TEST
+    run_loopback_test();
+#endif
+
+    // ========================================================================
     // Step 6: Initialize WM (Weighing Machine) module
     // ========================================================================
 #ifdef CONFIG_NCLE_WM_ENABLE
     ESP_LOGI(TAG, "WM Module: Enabled");
     ESP_ERROR_CHECK(wm_uart_init());             // Initialize UART driver
     wm_uart_set_activity_callback(on_activity);  // LED blinks when data received
+#ifdef CONFIG_NCLE_WM_VALIDATOR_ENABLE
+    /* Keep WM running continuously so the validator has a steady byte stream
+     * to compare. Without STREAM mode the driver auto-stops after the first
+     * stable reading and HW byte counts freeze. */
+    wm_uart_set_stream_mode(WM_MODE_STREAM);
+    wm_uart_set_sample_rate(1); /* log every sample to maximise HW byte flow */
+    ESP_LOGI(TAG, "WM Module: STREAM mode (for validator)");
+#endif
     ESP_ERROR_CHECK(wm_uart_start());            // Start receive task
 #else
     ESP_LOGI(TAG, "WM Module: Disabled");
+#endif
+
+#ifdef CONFIG_NCLE_WM_VALIDATOR_ENABLE
+    {
+        wm_uart_validator_config_t vcfg = {
+            .shared_gpio         = CONFIG_NCLE_WM_UART_RX_PIN,
+            .rmt_channel         = CONFIG_NCLE_WM_VALIDATOR_RMT_CHANNEL,
+            .baud_rate           = CONFIG_NCLE_WM_UART_BAUD_RATE,
+            .report_interval_ms  = CONFIG_NCLE_WM_VALIDATOR_REPORT_INTERVAL_MS,
+            .packet_quiet_ms     = CONFIG_NCLE_WM_VALIDATOR_PACKET_QUIET_MS,
+        };
+        esp_err_t verr = wm_uart_validator_init(&vcfg);
+        if (verr == ESP_OK) verr = wm_uart_validator_start();
+        if (verr != ESP_OK) {
+            ESP_LOGE(TAG, "WM validator failed to start: %d", verr);
+        } else {
+            ESP_LOGI(TAG, "WM validator running (GPIO %d, RMT ch %d, baud %d)",
+                     CONFIG_NCLE_WM_UART_RX_PIN,
+                     CONFIG_NCLE_WM_VALIDATOR_RMT_CHANNEL,
+                     CONFIG_NCLE_WM_UART_BAUD_RATE);
+        }
+    }
+#endif
+
+#ifdef CONFIG_NCLE_WM_VALIDATOR_RUN_SWEEP
+    {
+        static const int sweep_bauds[] = {9600, 19200, 38400, 57600, 115200};
+        vTaskDelay(pdMS_TO_TICKS(3000)); /* settle before starting */
+        wm_uart_validator_run_baud_sweep(sweep_bauds,
+                                         sizeof(sweep_bauds)/sizeof(sweep_bauds[0]),
+                                         CONFIG_NCLE_WM_VALIDATOR_SWEEP_SECONDS_PER_STEP);
+    }
 #endif
 
     // ========================================================================
@@ -691,6 +887,13 @@ void app_main(void)
 #ifdef CONFIG_NCLE_MA_ENABLE
         ma_uart_set_data_callback(ma_ble_data_callback);
         ESP_LOGI(TAG, "MA -> BLE callback registered");
+#endif
+
+        // Register GSM status callback - sends signal/registration to mobile app via BLE
+#ifdef CONFIG_NCLE_GSM_ENABLE
+        gsm_task_set_status_callback(gsm_ble_status_callback, NULL);
+        ESP_LOGI(TAG, "GSM -> BLE callback registered");
+        // gsm_task_start() is NOT called here; waits for BLE command {"command":"gsm_enable"}
 #endif
     } else {
         ESP_LOGE(TAG, "BLE SPP Module: Failed to initialize (0x%x)", ble_ret);

@@ -1,0 +1,26 @@
+menu "Soft UART (RMT-based)"
+
+    config SOFT_UART_RMT_LOG_LEVEL
+        int "Soft UART RMT log level (0=none,1=err,2=warn,3=info,4=debug,5=verbose)"
+        default 3
+        range 0 5
+        help
+            Verbosity for soft_uart_rmt component.
+
+    config SOFT_UART_RMT_DEFAULT_RESOLUTION_HZ
+        int "Default RMT resolution (Hz) for soft UART"
+        default 1000000
+        range 100000 10000000
+        help
+            RMT tick resolution. Must be > 16 * max baud rate for good sampling.
+            1 MHz (default) gives 1 us ticks, adequate up to ~115200 baud.
+
+    config SOFT_UART_RMT_DEFAULT_SYMBOL_MEM_WORDS
+        int "Default RMT symbol memory size (words)"
+        default 128
+        range 48 256
+        help
+            RMT receive buffer in 32-bit symbol words. Larger = more tolerant
+            to decoder task scheduling latency under load.
+
+endmenu

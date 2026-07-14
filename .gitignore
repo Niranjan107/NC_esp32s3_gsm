@@ -1,0 +1,21 @@
+# ESP-IDF build output (regenerated on each machine — never commit)
+/build/
+/build_check/
+
+# Managed components (re-fetched from idf_component.yml on build)
+/managed_components/
+
+# sdkconfig backup (sdkconfig itself IS committed)
+sdkconfig.old
+
+# IDE / clangd index cache
+.cache/
+.vscode/.clangd/
+
+# Compiled binaries / build artifacts
+*.exe
+*.out
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db

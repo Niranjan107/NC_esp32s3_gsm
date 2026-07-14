@@ -8,21 +8,35 @@ menu "NCLite CLEV4"
                 Enable Weighing Machine UART module.
                 Disable to exclude WM functionality from the build.
 
+        config NCLE_WM_USE_SOFT_UART
+            bool "Use RMT-based software UART for WM (frees a hardware UART for GSM)"
+            default y
+            depends on NCLE_WM_ENABLE
+            help
+                When enabled (recommended), WM data is received via the RMT-based
+                software UART driver (components/soft_uart_rmt) on the GPIO
+                configured by NCLE_WM_UART_RX_PIN. This frees a hardware UART
+                controller for the GSM module. When disabled, WM uses the
+                hardware UART selected by NCLE_WM_UART_NUM.
+
         config NCLE_WM_UART_NUM
-            int "WM UART Port Number (0, 1, or 2)"
+            int "WM Hardware UART Port Number (0, 1, or 2)"
             default 0
             range 0 2
             depends on NCLE_WM_ENABLE
             help
-                UART port number for Weighing Machine
+                Hardware UART controller for WM. Only used when
+                NCLE_WM_USE_SOFT_UART is disabled. Soft UART (recommended)
+                does not use any hardware UART controller.
 
         config NCLE_WM_UART_TX_ENABLE
             bool "Enable WM UART TX Pin"
             default n
             depends on NCLE_WM_ENABLE
             help
-                Enable TX pin for WM UART. Disable if only receiving data
-                from weighing machine (prevents garbage output on TX).
+                Enable TX pin for WM hardware UART. Disable if only receiving
+                data from weighing machine (prevents garbage output on TX).
+                Only relevant when soft UART is disabled (soft UART is RX-only).
 
         config NCLE_WM_UART_TX_PIN
             int "WM UART TX GPIO"
@@ -30,30 +44,32 @@ menu "NCLite CLEV4"
             range 0 48
             depends on NCLE_WM_UART_TX_ENABLE
             help
-                GPIO pin for WM UART TX
+                GPIO pin for WM hardware UART TX.
 
         config NCLE_WM_UART_RX_PIN
-            int "WM UART RX GPIO"
+            int "WM UART RX GPIO (used by both hard and soft UART paths)"
             default 44
             range 0 48
             depends on NCLE_WM_ENABLE
             help
-                GPIO pin for WM UART RX
+                GPIO pin for WM RX. The same pin is used regardless of
+                whether soft UART or hardware UART path is selected.
 
         config NCLE_WM_UART_BAUD_RATE
             int "WM UART Baud Rate"
             default 9600
             depends on NCLE_WM_ENABLE
             help
-                Baud rate for WM UART
+                Baud rate for WM serial communication.
 
         config NCLE_WM_UART_BUF_SIZE
-            int "WM UART Buffer Size"
+            int "WM Hardware UART Buffer Size"
             default 256
             range 128 1024
             depends on NCLE_WM_ENABLE
             help
-                Buffer size for WM UART RX/TX
+                Buffer size for WM hardware UART RX/TX. Only used when
+                NCLE_WM_USE_SOFT_UART is disabled.
     endmenu
 
     menu "MA (Milk Analyzer) UART"
@@ -232,6 +248,27 @@ menu "NCLite CLEV4"
                 Default: 3000 (single Li-Ion cell cutoff)
     endmenu
 
+    menu "Development: Soft UART Smoke Test"
+        config NCLE_SOFT_UART_LOOPBACK_TEST
+            bool "Enable soft UART GPIO loopback smoke test"
+            default n
+            help
+                When enabled, main.c runs a one-shot test that bit-bangs
+                the ASCII string "HELLO\n" on the TX GPIO and verifies that
+                soft_uart_rmt receives it on the RX GPIO. Requires a jumper
+                wire between TX and RX GPIOs. Disable for production.
+
+        config NCLE_SOFT_UART_LOOPBACK_TX_GPIO
+            int "Loopback TX GPIO"
+            default 15
+            depends on NCLE_SOFT_UART_LOOPBACK_TEST
+
+        config NCLE_SOFT_UART_LOOPBACK_RX_GPIO
+            int "Loopback RX GPIO"
+            default 44
+            depends on NCLE_SOFT_UART_LOOPBACK_TEST
+    endmenu
+
     menu "OTA Update"
         config NCLE_OTA_ENABLE
             bool "Enable OTA Updates"
@@ -247,6 +284,107 @@ menu "NCLite CLEV4"
             help
                 Enable automatic rollback to previous firmware if new
                 firmware fails to boot properly.
+    endmenu
+
+    menu "GSM Module (EC200U-CN)"
+        config NCLE_GSM_ENABLE
+            bool "Enable GSM Module"
+            default n
+            help
+                Enable GSM/LTE module support (Quectel EC200U-CN).
+                Requires hardware UART0 to be free - WM must be on soft UART
+                (CONFIG_NCLE_WM_USE_SOFT_UART=y).
+
+        config NCLE_GSM_UART_NUM
+            int "GSM UART Port Number (0, 1, or 2)"
+            default 0
+            range 0 2
+            depends on NCLE_GSM_ENABLE
+            help
+                UART controller for GSM module.
+                Default: UART0 (freed when WM uses soft UART).
+
+        config NCLE_GSM_UART_TX_PIN
+            int "GSM UART TX GPIO (ESP TX -> Module RX)"
+            default 16
+            range 0 48
+            depends on NCLE_GSM_ENABLE
+            help
+                GPIO pin for GSM UART TX. Default: GPIO16.
+
+        config NCLE_GSM_UART_RX_PIN
+            int "GSM UART RX GPIO (ESP RX <- Module TX)"
+            default 15
+            range 0 48
+            depends on NCLE_GSM_ENABLE
+            help
+                GPIO pin for GSM UART RX. Default: GPIO15.
+
+        config NCLE_GSM_PWRKEY_PIN
+            int "GSM PWRKEY GPIO"
+            default 7
+            range 0 48
+            depends on NCLE_GSM_ENABLE
+            help
+                GPIO pin for GSM module PWRKEY (power on/off control).
+
+        config NCLE_GSM_RST_PIN
+            int "GSM RESET GPIO"
+            default 8
+            range 0 48
+            depends on NCLE_GSM_ENABLE
+            help
+                GPIO pin for GSM module hardware RESET.
+
+        config NCLE_GSM_RST_INVERTED
+            bool "Inverted RESET polarity (HIGH = assert)"
+            default y
+            depends on NCLE_GSM_ENABLE
+            help
+                Default (on) matches the Conn_plus board design which uses
+                an inverter on the RESET line: HIGH = assert reset,
+                LOW = release reset.
+                Disable only if your CLv4 board is wired directly to the
+                EC200U RESET pin per datasheet (LOW = assert, HIGH idle).
+
+        config NCLE_GSM_UART_BAUD_RATE
+            int "GSM UART baud rate"
+            default 115200
+            depends on NCLE_GSM_ENABLE
+            help
+                Baud rate for AT command communication. EC200U default 115200.
+
+        config NCLE_GSM_TASK_POLL_INTERVAL_MS
+            int "Status poll interval (ms)"
+            default 10000
+            range 1000 60000
+            depends on NCLE_GSM_ENABLE
+            help
+                How often gsm_task checks alive/signal/network and fires the
+                status callback. Default: 10000 (10s).
+
+        config NCLE_GSM_APN
+            string "GSM APN (carrier-specific)"
+            default "airtelgprs.com"
+            depends on NCLE_GSM_ENABLE
+            help
+                Access Point Name for the SIM card carrier.
+                Common APNs (India):
+                - Airtel:    "airtelgprs.com"
+                - Jio:       "jionet"
+                - Vodafone:  "www"
+                - BSNL:      "bsnlnet"
+                Without correct APN, no data session can be established.
+
+        config NCLE_GSM_HTTP_INSECURE
+            bool "Skip TLS certificate verification (HTTPS insecure mode)"
+            default y
+            depends on NCLE_GSM_ENABLE
+            help
+                When enabled (default), HTTPS connections skip server
+                certificate verification (seclevel=0). Useful for testing
+                without uploading CA certs to the modem.
+                For PRODUCTION: disable this and provide proper CA cert.
     endmenu
 
 endmenu
