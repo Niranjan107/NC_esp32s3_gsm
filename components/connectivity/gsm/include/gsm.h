@@ -90,6 +90,15 @@ void             gsm_sim_cache_invalidate(void);
  */
 esp_err_t gsm_ppp_start(void);
 
+/**
+ * @brief Introduce this component to net_link (base/common).
+ *
+ * After this, the application layer can ask net_link_is_up() without knowing
+ * the transport is GSM - which is what lets components/application/ be shared
+ * with the WiFi product unchanged. Call once, before starting MQTT.
+ */
+void gsm_net_link_register(void);
+
 /* ===== Fault diagnosis =====
  *
  * Connectivity fails in six distinct ways, each needing a DIFFERENT fix. The

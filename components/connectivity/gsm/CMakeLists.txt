@@ -6,6 +6,8 @@ idf_component_register(
     # lwip + esp_http_client: the Step 1 self-test uses the STANDARD stack
     # (esp_ping, stock esp_http_client) to prove this is a real socket
     # interface rather than an AT-command wrapper.
+    # common: net_link, the contract the application layer talks to instead of
+    # this component directly.
     REQUIRES driver freertos esp_timer esp_netif esp_event nvs_flash
-             lwip esp_http_client
+             lwip esp_http_client common
 )

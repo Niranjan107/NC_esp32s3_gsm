@@ -28,6 +28,8 @@
 #include "ping/ping_sock.h"
 #include "lwip/inet.h"
 #include "esp_http_client.h"
+#include "net_link.h"        /* the contract the application layer talks to */
+#include "gsm_task.h"        /* cached status for status_json */
 
 static const char *TAG = "GSM";
 
@@ -780,6 +782,70 @@ esp_err_t gsm_ppp_start(void)
     ESP_LOGE(TAG, "  - not registered on the network (check gsm_get_network_status)");
     ESP_LOGE(TAG, "========================================");
     return ESP_ERR_NOT_FOUND;
+}
+
+/* ============================================================================
+ * net_link registration - the contract with the application layer
+ * ============================================================================
+ * The application (MQTT publish, store-and-forward, FOTA) asks exactly one
+ * question about the network: "can I send right now?". It must never learn
+ * WHETHER that link is GSM - otherwise components/application/ could not have
+ * been copied from the WiFi product unchanged, which it was.
+ *
+ * So the GSM component introduces itself here, and everything above it keeps
+ * calling net_link_is_up().
+ * ===========================================================================*/
+
+static bool gsm_link_is_up(void)
+{
+    /* Deliberately the PPP/lwIP view, not an AT-command claim: a modem can
+     * report a PDP context active while nothing routes. Must not block - this
+     * is called from the MQTT task's polling loop. */
+    return gsm_pdp_is_active();
+}
+
+/**
+ * @brief Describe this link for `diag` (net_link_t::status_json).
+ *
+ * The WiFi product's version of this reports ssid/ip/rssi; this one reports
+ * SIM and signal. diag itself is unchanged either way - it prints whatever the
+ * active link says about itself, which is what makes it transport-neutral.
+ *
+ * "operator" is deliberately absent: naming the carrier needs AT+COPS?, which
+ * is not wrapped, and the ICCID already identifies the SIM for support.
+ */
+static int gsm_link_status_json(char *buf, size_t size)
+{
+    gsm_status_t s;
+    gsm_task_get_last_status(&s);
+
+    return snprintf(buf, size,
+                    "{\"connected\":%s,\"sim\":\"%s\",\"registered\":%s,"
+                    "\"rssi\":%d,\"bars\":%d,\"iccid\":\"%s\",\"fault\":\"%s\"}",
+                    s.data_up    ? "true" : "false",
+                    gsm_sim_status_str(s.sim_status),
+                    s.registered ? "true" : "false",
+                    s.rssi, s.bars, s.iccid,
+                    gsm_fault_name(s.fault));
+}
+
+void gsm_net_link_register(void)
+{
+    /* Static storage: net_link keeps the pointer, so a stack copy would
+     * dangle. is_provisioned is left NULL - a SIM needs no credentials
+     * entered, unlike WiFi, and net_link treats absent as "yes". */
+    static const net_link_t gsm_link = {
+        .name        = "gsm",
+        .is_up       = gsm_link_is_up,
+        .status_json = gsm_link_status_json,
+    };
+
+    if (net_link_register(&gsm_link)) {
+        ESP_LOGI(TAG, "registered with net_link as '%s'", gsm_link.name);
+    } else {
+        ESP_LOGE(TAG, "net_link registration FAILED - the application layer "
+                      "will believe the device is permanently offline");
+    }
 }
 
 /* ============================================================================

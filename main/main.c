@@ -85,6 +85,15 @@
 #include "gsm_task.h"
 #endif
 
+// Application layer: what the device does with the internet. Reaches the
+// network only through net_link, so it is identical to the WiFi product's copy.
+#ifdef CONFIG_NCLE_MQTT_ENABLE
+#include "mqtt_client_svc.h"
+#endif
+#if defined(CONFIG_NCLE_MA_ENABLE) && defined(CONFIG_NCLE_WM_ENABLE)
+#include "wm_capture.h"
+#endif
+
 #ifdef CONFIG_NCLE_SOFT_UART_LOOPBACK_TEST
 #include "soft_uart_rmt.h"
 #include "driver/gpio.h"
@@ -268,7 +277,60 @@ static volatile bool s_led_activity_flag = false;
 static void wm_ble_data_callback(const char *json_data, size_t len)
 {
     ble_spp_output_callback(json_data, (unsigned int)len);
+    // The WM weight is merged into the MA message on the MQTT side (see
+    // wm_capture); WM does not publish its own cloud reading. wm_capture is fed
+    // from the base value callback, not from here, so the merge is unaffected
+    // if this BLE feed is ever gated off.
 }
+
+/* ============================================================================
+ * Base events -> application behaviour
+ * ============================================================================
+ * main.c is the composition root: the one place allowed to know all three
+ * layers. The base drivers emit GENERIC events - "a frame started", "here is a
+ * weight" - and these two adapters decide what they mean for this product,
+ * namely the cloud weight-capture window. Base therefore never references the
+ * application layer, which is what makes components/application/ copyable from
+ * the WiFi product unchanged.
+ *
+ * Both run on driver RX tasks, so they must stay this short.
+ */
+#if defined(CONFIG_NCLE_MA_ENABLE) && defined(CONFIG_NCLE_WM_ENABLE)
+static void on_ma_frame_start(bool terminator_framed)
+{
+    // The framing kind arrives with every frame, so the grace window can never
+    // be left set for the previous analyser model.
+    wm_capture_set_continuous(terminator_framed);
+    wm_capture_start();
+}
+
+static void on_wm_value(const char *value) { wm_capture_feed(value); }
+#endif
+
+#ifdef CONFIG_NCLE_MQTT_ENABLE
+/* Cloud commands (clv4/<id>/cmd) go through the same parser as BLE and USB, so
+ * a command behaves identically wherever it arrived from. */
+static void mqtt_command_handler(const char *data, int len)
+{
+    parse_and_process_commands((char *)data, len, CMD_SRC_MQTT);
+}
+
+/**
+ * @brief Fan command responses out to every available sink.
+ *
+ * BLE (local app) + MQTT clv4/<id>/resp (server). The USB console copy is
+ * emitted inside send_response() itself. Registered with cmd_parser so all
+ * three stay in sync regardless of where the command came from - otherwise a
+ * command sent from the server would be answered only to the phone.
+ */
+static void command_output_callback(const char *data, size_t len)
+{
+#ifdef CONFIG_BLE_SPP_ENABLED
+    ble_spp_output_callback(data, (unsigned int)len);
+#endif
+    mqtt_svc_publish_resp(data, (int)len);
+}
+#endif
 
 #ifdef CONFIG_NCLE_GSM_ENABLE
 /**
@@ -886,8 +948,14 @@ void app_main(void)
     if (ble_ret == ESP_OK) {
         ESP_LOGI(TAG, "BLE SPP Module: Enabled (Device: %s)", ble_spp_get_device_name());
 
-        // Register callback so command responses go to BLE (and USB console)
+        // Register callback so command responses go to BLE (and USB console).
+        // With MQTT present, use the fan-out so a command sent from the server
+        // is answered to the server too, not only to the phone.
+#ifdef CONFIG_NCLE_MQTT_ENABLE
+        cmd_parser_register_output_callback(command_output_callback);
+#else
         cmd_parser_register_output_callback(ble_spp_output_callback);
+#endif
 
         // Register WM data callback - sends weight data to mobile app via BLE
 #ifdef CONFIG_NCLE_WM_ENABLE
@@ -932,6 +1000,40 @@ void app_main(void)
     }
 #else
     ESP_LOGI(TAG, "BLE SPP Module: Disabled");
+#endif
+
+    // ========================================================================
+    // Step 9b: Application layer - MQTT publish + weight merge
+    // ========================================================================
+    // Deliberately OUTSIDE the BLE block above: the cloud path must work on a
+    // device with no phone connected, which is the normal field case.
+#if defined(CONFIG_NCLE_MA_ENABLE) && defined(CONFIG_NCLE_WM_ENABLE)
+    // Feed the weight-capture window from the base drivers' generic events.
+    // Registered before MQTT starts, so no reading can be missed.
+    ma_uart_set_frame_start_callback(on_ma_frame_start);
+    wm_uart_set_value_callback(on_wm_value);
+    ESP_LOGI(TAG, "WM capture hooks registered (MA frame start + WM value)");
+#endif
+
+#ifdef CONFIG_NCLE_MQTT_ENABLE
+    ESP_LOGI(TAG, "MQTT Module: Enabled");
+
+#ifdef CONFIG_NCLE_GSM_ENABLE
+    // Introduce GSM to net_link BEFORE starting MQTT: the MQTT task asks
+    // net_link_is_up() as soon as it runs, and a link registered late would
+    // read as "permanently offline" until the next poll.
+    gsm_net_link_register();
+#endif
+
+    // Route cloud commands (clv4/<id>/cmd) into the shared command parser.
+    mqtt_svc_set_cmd_callback(mqtt_command_handler);
+
+    esp_err_t mqtt_ret = mqtt_svc_start();
+    if (mqtt_ret != ESP_OK) {
+        ESP_LOGW(TAG, "MQTT Module: start failed (0x%x)", mqtt_ret);
+    }
+#else
+    ESP_LOGI(TAG, "MQTT Module: Disabled");
 #endif
 
     // ========================================================================

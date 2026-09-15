@@ -15,4 +15,7 @@ idf_component_register(
         soft_uart_rmt
         wm_uart_validator
         gsm
+        # Application layer (Step 4/5): MQTT publish + the weight merge.
+        mqtt_client_svc
+        wm_capture
 )
