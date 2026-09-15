@@ -93,6 +93,21 @@ typedef void (*wm_data_callback_t)(const char *json_data, size_t len);
  */
 typedef void (*wm_activity_callback_t)(void);
 
+/**
+ * @brief Callback carrying each CLEANED weight value, e.g. "0055.248Kg".
+ *
+ * Fires once per accepted weight, before the JSON is built and before the data
+ * callback - so a consumer sees the raw value without having to parse JSON back
+ * apart. The data callback cannot serve this purpose: it delivers the finished
+ * JSON string, not the value.
+ *
+ * @param value  NUL-terminated cleaned weight; valid only for the duration of
+ *               the call, so copy it if you need to keep it.
+ *
+ * Runs on the WM RX task - keep the handler short and non-blocking.
+ */
+typedef void (*wm_value_callback_t)(const char *value);
+
 // ============================================================================
 // Public API
 // ============================================================================
@@ -164,6 +179,12 @@ void wm_uart_set_data_callback(wm_data_callback_t callback);
  * @param callback Callback function (NULL to disable)
  */
 void wm_uart_set_activity_callback(wm_activity_callback_t callback);
+
+/**
+ * @brief Register the cleaned-value callback (see wm_value_callback_t)
+ * @param callback Callback function (NULL to disable)
+ */
+void wm_uart_set_value_callback(wm_value_callback_t callback);
 
 /**
  * @brief Print status and config (for debugging)

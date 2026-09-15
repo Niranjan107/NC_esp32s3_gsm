@@ -177,6 +177,7 @@ void wm_uart_set_raw_byte_callback(wm_uart_raw_byte_cb_t cb, void *ctx)
  */
 static wm_data_callback_t s_data_callback = NULL;
 static wm_activity_callback_t s_activity_callback = NULL;
+static wm_value_callback_t    s_value_callback    = NULL;
 
 /**
  * Stream Mode Configuration
@@ -382,6 +383,14 @@ static void output_wm_data(void)
     int json_len = snprintf(s_json_buffer, sizeof(s_json_buffer),
                             "{\"device\":\"wm\",\"data\":\"%s\",\"model\":%d }",
                             s_clean_buffer, s_model_id);
+
+    // Hand the cleaned value to whoever is listening, before the console/BLE
+    // output below and without affecting it. On the WiFi/GSM products the
+    // listener feeds it into the MA weight-capture window; this driver does not
+    // need to know that.
+    if (s_value_callback) {
+        s_value_callback(s_clean_buffer);
+    }
 
     // Log debug info (use DEBUG level to reduce console spam)
     ESP_LOGD(TAG, "");
@@ -775,7 +784,11 @@ esp_err_t wm_uart_start(void)
     }
 
     if (s_task_running) {
-        ESP_LOGW(TAG, "Task already running - skipping start");
+        /* Info, not a warning: ma_uart calls this on every MA frame to trigger
+         * the weigher (the dairy workflow), and cmd_parser calls it after a
+         * config change. Both rely on it being a no-op when already running, so
+         * logging it as a warning made normal operation look like a fault. */
+        ESP_LOGD(TAG, "Task already running - start is a no-op");
         return ESP_OK;
     }
 
@@ -961,6 +974,11 @@ void wm_uart_set_data_callback(wm_data_callback_t callback)
 void wm_uart_set_activity_callback(wm_activity_callback_t callback)
 {
     s_activity_callback = callback;
+}
+
+void wm_uart_set_value_callback(wm_value_callback_t callback)
+{
+    s_value_callback = callback;
 }
 
 void wm_uart_print_status(void)
