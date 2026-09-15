@@ -400,6 +400,18 @@ static void gsm_ble_status_callback(const gsm_status_t *s, void *ctx)
 static void ma_ble_data_callback(const char *json_data, int len)
 {
     ble_spp_output_callback(json_data, (unsigned int)len);
+
+#ifdef CONFIG_NCLE_MQTT_ENABLE
+    // Hand a COPY of the same JSON to the MQTT queue (non-blocking). Publishing
+    // is deliberately NOT gated on the app being connected: the cloud path
+    // always runs, so a reading reaches the broker - or the flash buffer - no
+    // matter what the phone is or is not receiving.
+    //
+    // mqtt_client_svc merges this transaction's settled WM weight in on the way
+    // out (wm_capture), so the server sees the milk data and the weight
+    // together as one reading.
+    mqtt_svc_publish_data(json_data, len);
+#endif
 }
 #endif
 
