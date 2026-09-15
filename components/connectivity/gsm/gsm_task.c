@@ -5,6 +5,7 @@
 #include <string.h>
 #include "esp_log.h"
 #include "esp_system.h"      /* esp_restart - SIM recovery backstop */
+#include "esp_timer.h"       /* BLE status heartbeat timing */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
@@ -25,6 +26,15 @@ static gsm_status_cb_t    s_status_cb    = NULL;
 static void              *s_status_ctx   = NULL;
 static gsm_status_t       s_last_status  = {0};
 static gsm_fault_t        s_last_fault   = GSM_FAULT_NONE;
+
+/* Last status actually sent to the app, and when. Used to suppress repeats:
+ * see the change check in poll_and_report(). */
+static gsm_status_t       s_last_sent    = {0};
+static int64_t            s_last_sent_us = 0;
+
+/* Send an unchanged status at least this often, so the app can tell the device
+ * is still alive rather than merely quiet. */
+#define GSM_BLE_HEARTBEAT_MS   60000    /* 1 min */
 
 /* False until gsm_ppp_start() has run at least once. Before that, data=0 is
  * the normal starting state rather than a fault worth reporting. */
@@ -52,6 +62,45 @@ static uint8_t            s_sim_absent_polls = 0;
  * 2 minutes failing rather than entering a reboot loop. */
 static uint8_t            s_sim_recovery_attempts = 0;
 #define GSM_SIM_REBOOT_AFTER_ATTEMPTS  4
+
+/**
+ * @brief Forward a status to the app only when it MEANS something new.
+ *
+ * Polling every 10s and forwarding every result sent an identical ~200-byte
+ * message six times a minute forever. On the operator's phone terminal that
+ * buried the WM and MA readings they actually need to read, and it spent BLE
+ * bandwidth restating "Everything working".
+ *
+ * A slow heartbeat still goes out so the app can distinguish "device fine and
+ * quiet" from "device gone".
+ *
+ * Signal strength is deliberately NOT compared: rssi drifts by a point or two
+ * constantly, so including it would defeat the check entirely. Bars are
+ * compared - they only move on a change the user would notice.
+ */
+static void publish_if_changed(const gsm_status_t *s)
+{
+    if (s_status_cb == NULL) return;
+
+    bool changed =
+        (s->alive      != s_last_sent.alive)      ||
+        (s->sim_status != s_last_sent.sim_status) ||
+        (s->registered != s_last_sent.registered) ||
+        (s->data_up    != s_last_sent.data_up)    ||
+        (s->fault      != s_last_sent.fault)      ||
+        (s->bars       != s_last_sent.bars);
+
+    int64_t now_us = esp_timer_get_time();
+    bool heartbeat_due =
+        (s_last_sent_us == 0) ||
+        ((now_us - s_last_sent_us) >= ((int64_t)GSM_BLE_HEARTBEAT_MS * 1000));
+
+    if (!changed && !heartbeat_due) return;
+
+    s_status_cb(s, s_status_ctx);
+    s_last_sent    = *s;
+    s_last_sent_us = now_us;
+}
 
 static uint8_t rssi_to_bars(uint8_t rssi)
 {
@@ -120,7 +169,7 @@ static void poll_and_report(void)
         s.fault = GSM_FAULT_NONE;
 
         s_last_status = s;
-        if (s_status_cb) s_status_cb(&s, s_status_ctx);
+        publish_if_changed(&s);
         ESP_LOGI(TAG, "alive=1 sim=%s reg=%d rssi=%d bars=%d net=%d data=1 (DATA mode)",
                  gsm_sim_status_str(s.sim_status), s.registered,
                  s.rssi, s.bars, (int)s.net_status);
@@ -369,7 +418,7 @@ static void poll_and_report(void)
 
     s_last_status = s;
 
-    if (s_status_cb) s_status_cb(&s, s_status_ctx);
+    publish_if_changed(&s);
 
     if (s.fault == GSM_FAULT_NONE) {
         ESP_LOGI(TAG, "alive=%d sim=%s reg=%d rssi=%d bars=%d net=%d data=%d",
@@ -420,7 +469,10 @@ static void gsm_task_body(void *arg)
             .net_status = GSM_NET_UNKNOWN,
         };
         s_last_status = bad;
-        if (s_status_cb) s_status_cb(&bad, s_status_ctx);
+        /* Through the same filter: the FIRST failure is a real change and goes
+         * out immediately, but a modem that stays absent must not resend the
+         * same message on every back-off retry. */
+        publish_if_changed(&bad);
 
         /* Sleep in 1s slices so gsm_task_stop() is still observed promptly */
         for (uint32_t waited = 0; waited < retry_delay_ms && s_running;
