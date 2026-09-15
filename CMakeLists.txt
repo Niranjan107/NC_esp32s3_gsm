@@ -29,5 +29,11 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(NCLite_ESP32S3)
 
 # Firmware version
-set(NCLE_FIRMWARE_VERSION "2.0.0.1000")
-add_compile_definitions(NCLE_FIRMWARE_VERSION="${NCLE_FIRMWARE_VERSION}")
+# Bumped from 2.0.0.1000 (pre-port) once GSM/PPP, the three-layer restructure
+# and the shared cloud layer landed - a build this different must not keep the
+# old number, or a bug report cannot be tied to a firmware.
+set(NCLE_FIRMWARE_VERSION "2.1.0.1000")
+# idf_build_set_property, not add_compile_definitions: the latter only reaches
+# targets defined after this point, which silently misses components. Matches
+# the WiFi product.
+idf_build_set_property(COMPILE_DEFINITIONS "NCLE_FIRMWARE_VERSION=\"${NCLE_FIRMWARE_VERSION}\"" APPEND)

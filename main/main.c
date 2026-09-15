@@ -862,6 +862,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "   NCLite ESP32-S3 Starting...");
+    ESP_LOGI(TAG, "   Firmware version: %s", NCLE_FIRMWARE_VERSION);
     ESP_LOGI(TAG, "========================================");
 
     // ========================================================================
