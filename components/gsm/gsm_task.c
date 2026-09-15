@@ -97,7 +97,12 @@ static void poll_and_report(void)
          * "sim=absent reg=0" alongside data=1), and a status that contradicts
          * itself is worse than no status: it sends the field team to check a
          * SIM that is demonstrably fine. Trust the data link. */
-        if (s.sim_status != GSM_SIM_READY) {
+        /* Only correct a status that says the SIM is faulty or busy - never one
+         * that says it is ABSENT. A live data link proves a SIM was present
+         * when the session began, not that it still is: pulling the card leaves
+         * PPP up until the keepalive notices, and overriding "absent" here
+         * would report a healthy SIM for a card sitting on the bench. */
+        if (s.sim_status != GSM_SIM_READY && s.sim_status != GSM_SIM_ABSENT) {
             ESP_LOGI(TAG, "data link up - correcting stale sim=%s to ready",
                      gsm_sim_status_str(s.sim_status));
             s.sim_status = GSM_SIM_READY;
@@ -134,8 +139,34 @@ static void poll_and_report(void)
         }
         s_unanswered_polls = 0;    /* answered, so clear the strike count */
 
-        /* Re-read the SIM when it is not currently READY, so a card put back in
-         * is noticed without a reboot.
+        /* Re-read the SIM on EVERY poll, not only when the cached value is
+         * already bad.
+         *
+         * Reading it only when "not READY" meant a SIM pulled out while
+         * connected was never noticed: the cached value still said READY, so
+         * the re-read was skipped, and the status reported sim=ready with
+         * rssi=31 while blaming the antenna for the resulting no_coverage.
+         * The card had been out for minutes.
+         *
+         * gsm_get_sim_status() caches for 5s internally, so polling every 10s
+         * costs one AT round trip - the same as before. */
+        {
+            gsm_sim_status_t now = gsm_get_sim_status();
+            if (now != s_last_status.sim_status) {
+                ESP_LOGI(TAG, "SIM state changed: %s -> %s",
+                         gsm_sim_status_str(s_last_status.sim_status),
+                         gsm_sim_status_str(now));
+                s_last_status.sim_status = now;
+                if (now != GSM_SIM_READY) {
+                    /* Card gone: drop the ICCID so a different SIM cannot be
+                     * reported under the old one's serial. */
+                    s_last_status.iccid[0] = '\0';
+                }
+            }
+        }
+
+        /* Recovery when it is not READY, so a card put back in is noticed
+         * without a reboot.
          *
          * IMPORTANT: the EC200U only reads the SIM slot at power-up. Simply
          * asking +CPIN? again after re-insertion returns "not inserted"
@@ -148,7 +179,8 @@ static void poll_and_report(void)
          * ask again. Reset is rate-limited so a genuinely empty holder does not
          * put the device into a reset loop. */
         if (s_last_status.sim_status != GSM_SIM_READY) {
-            gsm_sim_status_t now = gsm_get_sim_status();
+            /* Value already refreshed by the unconditional read above. */
+            gsm_sim_status_t now = s_last_status.sim_status;
 
             if (now != GSM_SIM_READY &&
                 ++s_sim_absent_polls >= GSM_SIM_RESET_AFTER_POLLS) {
@@ -283,7 +315,12 @@ static void poll_and_report(void)
     bool truly_registered = (s.net_status == GSM_NET_REGISTERED_HOME ||
                              s.net_status == GSM_NET_REGISTERED_ROAMING);
 
-    if (truly_registered && s.sim_status != GSM_SIM_READY) {
+    /* Never override a definite ABSENT - the modem can still report a stale
+     * registration for a few polls after the card is pulled, and "registered
+     * therefore the SIM is fine" would then hide the real fault behind a
+     * no_coverage message telling the user to check the antenna. */
+    if (truly_registered && s.sim_status != GSM_SIM_READY &&
+        s.sim_status != GSM_SIM_ABSENT) {
         ESP_LOGI(TAG, "registered but sim=%s - re-reading SIM status",
                  gsm_sim_status_str(s.sim_status));
         s.sim_status = gsm_get_sim_status();
