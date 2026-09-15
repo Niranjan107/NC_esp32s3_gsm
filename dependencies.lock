@@ -15,6 +15,6 @@ dependencies:
     version: 5.5.0
 direct_dependencies:
 - espressif/esp_modem
-manifest_hash: 2abb76b6f55b0a806990c81533d42b83f4e57d20b40c8ad8ba775f634f24c197
+manifest_hash: 9ce3fc7d7453abfbe6107c42b37ae9b154f97cba6943db03ff5ef0473c139b2c
 target: esp32s3
 version: 2.0.0

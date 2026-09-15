@@ -3,8 +3,19 @@
 cmake_minimum_required(VERSION 3.16)
 
 # Set the project components
+# Components are organised in three layers (see docs/GSM_PORT_PLAN.md):
+#   base/         - meters, printer, BLE, commands, settings, chunked OTA.
+#                   Identical in every CLV4 product; never edited per variant.
+#   connectivity/ - how the device reaches the internet. THE ONLY LAYER THAT
+#                   DIFFERS between products: gsm here, wifi_sta in the WiFi
+#                   project.
+#   application/  - what the device does with the internet (MQTT publish,
+#                   store-and-forward, weight merge, HTTPS FOTA). Portable:
+#                   copied from the WiFi product unchanged.
 set(EXTRA_COMPONENT_DIRS
-    "${CMAKE_CURRENT_SOURCE_DIR}/components"
+    "${CMAKE_CURRENT_SOURCE_DIR}/components/base"
+    "${CMAKE_CURRENT_SOURCE_DIR}/components/connectivity"
+    "${CMAKE_CURRENT_SOURCE_DIR}/components/application"
 )
 
 # This board has no display. esp_lcd is unused, and its RGB panel driver makes
