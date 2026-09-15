@@ -1,4 +1,8 @@
 # ESP32-S3 Partition Table for NCLite with OTA Support
+#
+# Matches the WiFi product's layout so both share one flash map. The board has
+# 16MB; this uses the first 8MB and leaves the rest free.
+#
 # Name,   Type, SubType,  Offset,   Size,    Flags
 # NVS partition for configuration storage
 nvs,      data, nvs,      0x9000,   0x4000,
@@ -6,9 +10,13 @@ nvs,      data, nvs,      0x9000,   0x4000,
 otadata,  data, ota,      0xd000,   0x2000,
 # PHY init data
 phy_init, data, phy,      0xf000,   0x1000,
-# OTA partition 0 (primary app)
-ota_0,    app,  ota_0,    0x10000,  0x180000,
-# OTA partition 1 (secondary app for updates)
-ota_1,    app,  ota_1,    0x190000, 0x180000,
+# OTA partition 0 (primary app) - 3MB slot
+ota_0,    app,  ota_0,    0x10000,  0x300000,
+# OTA partition 1 (secondary app for OTA updates) - 3MB slot
+ota_1,    app,  ota_1,    0x310000, 0x300000,
+# Offline store-and-forward buffer (LittleFS, label must stay "storage":
+# store_forward.c mounts it by that name). Holds readings taken while the
+# link is down, so nothing is lost between sessions.
+storage,  data, spiffs,   0x610000, 0x100000,
 # NVS key partition (optional, for encryption)
-nvs_key,  data, nvs_keys, 0x310000, 0x1000,
+nvs_key,  data, nvs_keys, 0x710000, 0x1000,

@@ -1,0 +1,5 @@
+## Managed component dependencies for mqtt_client_svc
+## LittleFS backs the offline store-and-forward buffer on the `storage`
+## partition (power-loss resilient — the device powers off every session).
+dependencies:
+  joltwallet/littlefs: "^1.14.0"

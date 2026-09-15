@@ -423,4 +423,9 @@ menu "NCLite CLEV4"
                 For PRODUCTION: disable this and provide proper CA cert.
     endmenu
 
+    # Application layer config lives in the component itself, nested here so the
+    # whole product presents one clean menu. Path is relative to THIS file -
+    # getting it wrong is what broke the WiFi build during its own restructure.
+    rsource "../components/application/mqtt_client_svc/Kconfig.in"
+
 endmenu

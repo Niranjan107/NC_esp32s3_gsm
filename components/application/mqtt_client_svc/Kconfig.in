@@ -1,0 +1,59 @@
+menu "MQTT"
+
+    config NCLE_MQTT_ENABLE
+        bool "Enable MQTT cloud connectivity"
+        default n
+        help
+            Publish milk readings and receive commands over MQTT.
+            When disabled, the firmware behaves identically to the
+            non-MQTT build.
+
+    config NCLE_MQTT_BROKER_URI
+        string "MQTT broker URI"
+        depends on NCLE_MQTT_ENABLE
+        default "mqtt://broker.hivemq.com:1883"
+        help
+            Broker URI. Dev: mqtt://broker.hivemq.com:1883 (plain).
+            Production later: mqtts://<server>:8883 (TLS) via a config change.
+
+    config NCLE_MQTT_USERNAME
+        string "MQTT username (empty = anonymous)"
+        depends on NCLE_MQTT_ENABLE
+        default ""
+        help
+            Username for brokers that require authentication (HiveMQ Cloud,
+            the production server). Leave EMPTY for anonymous brokers such as
+            the public test broker - the credentials are then not sent at all.
+
+    config NCLE_MQTT_PASSWORD
+        string "MQTT password"
+        depends on NCLE_MQTT_ENABLE
+        default ""
+        help
+            Password paired with NCLE_MQTT_USERNAME. Ignored when the username
+            is empty. NOTE: this ends up in sdkconfig - do not commit a real
+            production password to the repository.
+
+    config NCLE_MQTT_RESTRICT_RISKY_CMDS
+        bool "Block risky commands over MQTT (wifi_config/wifi_erase/reset_config)"
+        depends on NCLE_MQTT_ENABLE
+        default y
+        help
+            When enabled (default), wifi_config, wifi_erase and reset_config
+            are REJECTED if received over MQTT (cloud) - they can cut the
+            device off its network or wipe its setup, so they are allowed only
+            over BLE / USB console (on-site). Disable to permit these remotely
+            (e.g. for full remote management once the internal server is trusted).
+
+    config NCLE_MQTT_STORE_FORWARD
+        bool "Store-and-forward: buffer readings offline (LittleFS)"
+        depends on NCLE_MQTT_ENABLE
+        default y
+        help
+            When enabled (default), readings that occur while the broker is
+            unreachable are saved to the `storage` flash partition (LittleFS)
+            and flushed to the cloud on reconnect (oldest-first, deleted only
+            after the broker ACKs). Survives power-off. When disabled, offline
+            readings are dropped (BLE/console still deliver them).
+
+endmenu
