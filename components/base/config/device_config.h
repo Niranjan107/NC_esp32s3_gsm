@@ -56,12 +56,50 @@ extern "C" {
 #define DEFAULT_STOP_BITS           STOP_BITS_1
 #define DEFAULT_PARITY              PARITY_NONE
 
+// Where MA/WM readings are delivered over BLE. The cloud path is never
+// affected by this setting - readings always go to MQTT (and to the flash
+// buffer when the broker is down).
+//
+//   AUTO   - BLE readings only while MQTT is DOWN. Once the broker is
+//            connected the app stops receiving readings, because the cloud
+//            is already carrying them. This is the default.
+//   ALWAYS - BLE readings always sent, i.e. both paths at once (pre-2.0.0.1005
+//            behaviour). Kept for sites that need the app to display live.
+//   OFF    - BLE readings never sent.
+//
+// Gated on the BROKER being connected, not on WiFi: a router with no internet
+// gives connected=true/cloud=false, and there the app must keep receiving or
+// the reading would be visible nowhere.
+//
+// Command replies are NOT affected - they always go over BLE, so the app can
+// still provision WiFi and run diag on a device that is online.
+#define BLE_DATA_AUTO               0
+#define BLE_DATA_ALWAYS             1
+#define BLE_DATA_OFF                2
+#define DEFAULT_BLE_DATA_MODE       BLE_DATA_AUTO
+
+// Store-and-forward: buffer every MA reading to flash and delete it only once
+// the broker has acknowledged it.
+//
+// ON (default) - the reliability guarantee. A reading survives a WiFi outage,
+//                a dead-looking link, and a power cut.
+// OFF          - for a site that will NEVER have WiFi, where the mobile app is
+//                the only delivery path. Buffering there just fills the ~2800
+//                record buffer over a few weeks and then evicts in a loop.
+//
+// Turn this off ONLY for a permanently app-only site. At a site with
+// intermittent WiFi it would discard readings during exactly the outages the
+// buffer exists to cover.
+#define DEFAULT_STORE_FORWARD       true
+
 // Device configuration structure
 typedef struct {
     uart_port_config_t ma_config;       // Milk Analyzer config
     uart_port_config_t wm_config;       // Weighing Machine config
     uart_port_config_t printer_config;  // Printer config
     char device_name[32];               // BLE device name
+    uint8_t ble_data_mode;              // BLE_DATA_AUTO / _ALWAYS / _OFF
+    bool store_forward;                 // buffer readings to flash (default on)
 } device_config_t;
 
 // Global device configuration (extern)
@@ -72,6 +110,15 @@ void config_load_defaults(device_config_t *config);
 esp_err_t config_load_from_nvs(device_config_t *config);
 esp_err_t config_save_to_nvs(const device_config_t *config);
 esp_err_t config_reset_to_defaults(void);
+
+// BLE reading delivery mode (BLE_DATA_AUTO / _ALWAYS / _OFF)
+esp_err_t config_set_ble_data_mode(uint8_t mode);
+uint8_t   config_get_ble_data_mode(void);
+const char *config_ble_data_mode_name(uint8_t mode);
+
+// Store-and-forward on/off (off only for permanently app-only sites)
+esp_err_t config_set_store_forward(bool enable);
+bool      config_get_store_forward(void);
 
 // Individual port configuration
 esp_err_t config_set_ma_port(const uart_port_config_t *config);

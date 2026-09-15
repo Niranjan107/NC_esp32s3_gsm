@@ -47,6 +47,8 @@ static const char *KEY_MA_CONFIG = "ma_cfg";
 static const char *KEY_WM_CONFIG = "wm_cfg";
 static const char *KEY_PRINTER_CONFIG = "printer_cfg";
 static const char *KEY_DEVICE_NAME = "dev_name";
+static const char *KEY_BLE_DATA_MODE = "ble_data";
+static const char *KEY_STORE_FORWARD = "sf_on";
 
 /**
  * Global device configuration structure
@@ -104,6 +106,12 @@ void config_load_defaults(device_config_t *config)
     // Device name
     strncpy(config->device_name, "Nitara BLE", sizeof(config->device_name) - 1);
 
+    // BLE reading delivery: AUTO = app stops receiving once the broker is up
+    config->ble_data_mode = DEFAULT_BLE_DATA_MODE;
+
+    // Store-and-forward on: never lose a reading to a network outage
+    config->store_forward = DEFAULT_STORE_FORWARD;
+
     ESP_LOGI(TAG, "Default configuration loaded");
 }
 
@@ -151,6 +159,23 @@ esp_err_t config_load_from_nvs(device_config_t *config)
         ESP_LOGW(TAG, "Device name not found in NVS");
     }
 
+    // Load BLE reading delivery mode. Absent on a device flashed before
+    // 2.0.0.1005, so keep the default the caller already loaded rather than
+    // leaving the field uninitialised.
+    uint8_t mode;
+    err = nvs_get_u8(handle, KEY_BLE_DATA_MODE, &mode);
+    if (err == ESP_OK && mode <= BLE_DATA_OFF) {
+        config->ble_data_mode = mode;
+    } else {
+        config->ble_data_mode = DEFAULT_BLE_DATA_MODE;
+    }
+
+    // Store-and-forward. Absent on a device flashed before 2.0.0.1005 -> ON,
+    // so an upgrade never silently drops the reliability guarantee.
+    uint8_t sf_on;
+    err = nvs_get_u8(handle, KEY_STORE_FORWARD, &sf_on);
+    config->store_forward = (err == ESP_OK) ? (sf_on != 0) : DEFAULT_STORE_FORWARD;
+
     nvs_close(handle);
     ESP_LOGI(TAG, "Configuration loaded from NVS");
     return ESP_OK;
@@ -194,6 +219,18 @@ esp_err_t config_save_to_nvs(const device_config_t *config)
         ESP_LOGE(TAG, "Failed to save device name");
     }
 
+    // Save BLE reading delivery mode
+    err = nvs_set_u8(handle, KEY_BLE_DATA_MODE, config->ble_data_mode);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save BLE data mode");
+    }
+
+    // Save store-and-forward flag
+    err = nvs_set_u8(handle, KEY_STORE_FORWARD, config->store_forward ? 1 : 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save store-forward flag");
+    }
+
     err = nvs_commit(handle);
     nvs_close(handle);
 
@@ -217,6 +254,54 @@ esp_err_t config_set_ma_port(const uart_port_config_t *config)
 {
     memcpy(&g_device_config.ma_config, config, sizeof(uart_port_config_t));
     return config_save_to_nvs(&g_device_config);
+}
+
+/**
+ * @brief Set where MA/WM readings are delivered over BLE.
+ *
+ * Only affects the BLE copy. Readings always go to MQTT, and to the flash
+ * buffer while the broker is down, whatever this is set to.
+ */
+esp_err_t config_set_ble_data_mode(uint8_t mode)
+{
+    if (mode > BLE_DATA_OFF) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    g_device_config.ble_data_mode = mode;
+    return config_save_to_nvs(&g_device_config);
+}
+
+uint8_t config_get_ble_data_mode(void)
+{
+    return g_device_config.ble_data_mode;
+}
+
+/**
+ * @brief Turn the flash buffer on or off.
+ *
+ * OFF is for a site that will never have WiFi, where the app is the only
+ * delivery path. Everywhere else this must stay ON - it is what makes a
+ * reading survive an outage.
+ */
+esp_err_t config_set_store_forward(bool enable)
+{
+    g_device_config.store_forward = enable;
+    return config_save_to_nvs(&g_device_config);
+}
+
+bool config_get_store_forward(void)
+{
+    return g_device_config.store_forward;
+}
+
+const char *config_ble_data_mode_name(uint8_t mode)
+{
+    switch (mode) {
+        case BLE_DATA_AUTO:   return "auto";
+        case BLE_DATA_ALWAYS: return "always";
+        case BLE_DATA_OFF:    return "off";
+        default:              return "unknown";
+    }
 }
 
 /**

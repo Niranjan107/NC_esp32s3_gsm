@@ -589,7 +589,7 @@ static void console_task(void *arg)
                     // Only process if it looks like JSON (starts with '{')
                     // Ignores garbage characters or partial commands
                     if (cmd_buf[0] == '{') {
-                        parse_and_process_commands(cmd_buf, cmd_idx);
+                        parse_and_process_commands(cmd_buf, cmd_idx, CMD_SRC_CONSOLE);
                     }
                 }
                 // Reset buffer for next command

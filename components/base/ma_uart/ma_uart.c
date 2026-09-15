@@ -76,6 +76,7 @@
 
 #include "ma_uart.h"
 #include "wm_uart.h"  // For MA→WM trigger (Pico2W behavior)
+#include "common.h"   // For cycle timing instrumentation
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -86,6 +87,7 @@
 #include "freertos/task.h"
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 static const char *TAG = "MA_UART";
 
@@ -118,6 +120,48 @@ static char s_last_reading[MA_UART_BUF_SIZE];   // Last processed value
 // Timeout tracking
 #define MA_RX_TIMEOUT_US    (MA_RX_TIMEOUT_MS * 1000)
 static int64_t s_last_rx_time = 0;
+static int64_t s_first_rx_time = 0;   /* first byte of the current message (timing/debug) */
+
+/**
+ * Largest silence between chunks of the SAME frame, measured per frame.
+ *
+ * The timeout must comfortably exceed the biggest mid-frame pause, or a single
+ * analyser slip would be split into several packets. Reported per frame so a
+ * measured value can replace the inherited 3000ms guess.
+ */
+static int64_t s_max_gap_us = 0;
+
+/**
+ * Adaptive receive timeout.
+ *
+ * s_rx_timeout_us starts at the MA_RX_TIMEOUT_MS ceiling so the very first
+ * frame after boot is always safe. After each frame we take the largest pause
+ * that frame contained, add 50% margin, and use that for the NEXT frame -
+ * clamped between MA_RX_TIMEOUT_MIN_MS and MA_RX_TIMEOUT_MS.
+ *
+ * The timeout is only ever applied to the following frame, because a frame has
+ * to survive its own pauses in order to measure them.
+ *
+ * s_learned_frame_len is the longest complete frame seen. If a frame arrives
+ * dramatically shorter than that, we almost certainly cut it early - so the
+ * timeout is thrown back to the ceiling and re-learned from scratch. Frame
+ * length is the only signal we have that a split happened.
+ */
+static int64_t s_learned_gap_us = 0;
+static int64_t s_rx_timeout_us = (int64_t)MA_RX_TIMEOUT_MS * 1000;
+static size_t  s_learned_frame_len = 0;
+static size_t  s_learned_line_count = 0;
+static int     s_consecutive_short_frames = 0;
+static size_t  s_rx_line_count = 0;
+
+/**
+ * Line count shared by the current run of short frames.
+ *
+ * A genuine format change (different analyser attached) is deterministic - it
+ * truncates at the same place every time. A loose cable is not. Requiring the
+ * run to agree keeps a hardware fault from being adopted as the new normal.
+ */
+static size_t  s_short_run_line_count __attribute__((unused)) = 0;
 
 // Statistics
 static ma_stats_t s_stats = {0};
@@ -129,6 +173,7 @@ static volatile bool s_task_running = false;
 // Callbacks
 static ma_data_callback_t s_data_callback = NULL;
 static ma_activity_callback_t s_activity_callback = NULL;
+static ma_frame_start_callback_t s_frame_start_callback = NULL;
 
 // Stream mode
 static int s_stream_mode = MA_MODE_SINGLE;      // 0=single-read, 1=stream
@@ -178,6 +223,100 @@ static void update_detect_mode(void)
         s_detect_mode = MA_DETECT_TIMEOUT;
         ESP_LOGI(TAG, "Detection mode: TIMEOUT (model %d)", s_model_id);
     }
+    /* NOTE: this used to call wm_capture_set_continuous() here. The framing kind
+     * now rides on the frame-start callback instead (see the s_rx_index == 0
+     * block), which keeps this base driver free of any weight/cloud knowledge
+     * and means a listener's copy of the flag cannot go stale. */
+}
+
+/**
+ * @brief Re-tune the receive timeout from the frame that just completed
+ *
+ * Called once per frame, before the buffers are reset. Takes the largest pause
+ * that frame contained, adds 50% margin, and clamps the result - the new value
+ * applies to the NEXT frame.
+ *
+ * If the frame came in far shorter than the longest one we have seen, we treat
+ * that as evidence the timeout cut it early: the learned value is discarded and
+ * we go back to the full ceiling. Frame length is the only split signal we have.
+ */
+static void update_rx_timeout(size_t frame_len, size_t line_count)
+{
+#if !CONFIG_NCLE_MA_ADAPTIVE_TIMEOUT
+    // Adaptive timeout disabled in menuconfig - hold the fixed ceiling, which
+    // is the behaviour this firmware has always had. Enable
+    // NCLE_MA_ADAPTIVE_TIMEOUT to let the driver learn a shorter wait.
+    // Measurement still runs, so the "MA frame: ... max_gap=" log remains
+    // available for analysis without altering timing.
+    (void)frame_len;
+    (void)line_count;
+    s_rx_timeout_us = (int64_t)MA_RX_TIMEOUT_MS * 1000;
+    return;
+#else
+    const int64_t ceiling_us = (int64_t)MA_RX_TIMEOUT_MS * 1000;
+    const int64_t floor_us   = (int64_t)MA_RX_TIMEOUT_MIN_MS * 1000;
+
+    // Suspected split: much fewer newlines than the longest complete frame seen.
+    if (s_learned_line_count > 0 && line_count < (s_learned_line_count / 2)) {
+
+        // Only count this towards a format change if it MATCHES the previous
+        // short frame. A different analyser truncates identically every time;
+        // a loose cable or brown-out truncates at random points. Requiring the
+        // run to agree keeps a hardware fault from being adopted as normal.
+        if (s_consecutive_short_frames > 0 && line_count == s_short_run_line_count) {
+            s_consecutive_short_frames++;
+        } else {
+            s_consecutive_short_frames = 1;
+            s_short_run_line_count = line_count;
+        }
+
+        ESP_LOGW(TAG, "Short frame (%d vs %d lines, %d vs %d bytes) - suspected early cut (consecutive short: %d), restoring %dms timeout",
+                 (int)line_count, (int)s_learned_line_count, (int)frame_len, (int)s_learned_frame_len, s_consecutive_short_frames, MA_RX_TIMEOUT_MS);
+
+        s_learned_gap_us = 0;
+        s_rx_timeout_us  = ceiling_us;
+
+        // Three in a row, all the same length - that is deterministic, so treat
+        // it as a genuine format/analyser change rather than a fault.
+        if (s_consecutive_short_frames >= 3) {
+            ESP_LOGI(TAG, "3 consecutive short frames all with %d lines. Adapting to new format/analyzer.", (int)line_count);
+            s_learned_line_count = line_count;
+            s_learned_frame_len = frame_len;
+            s_consecutive_short_frames = 0;
+            s_short_run_line_count = 0;
+            // Fall through to learn the new timeout gap
+        } else {
+            return;   // do not learn a length from a fragment
+        }
+    } else {
+        // Successful/full frame - reset consecutive short frames counter
+        s_consecutive_short_frames = 0;
+        s_short_run_line_count = 0;
+    }
+
+    if (line_count > s_learned_line_count) {
+        s_learned_line_count = line_count;
+    }
+    if (frame_len > s_learned_frame_len) {
+        s_learned_frame_len = frame_len;
+    }
+
+    if (s_max_gap_us > s_learned_gap_us) {
+        s_learned_gap_us = s_max_gap_us;
+    }
+
+    // x1.5 margin over the worst pause actually observed
+    int64_t want = (s_learned_gap_us * 3) / 2;
+    if (want < floor_us)   want = floor_us;
+    if (want > ceiling_us) want = ceiling_us;
+
+    if (want != s_rx_timeout_us) {
+        ESP_LOGI(TAG, "RX timeout adapted: %ldms -> %ldms (worst pause %ldms, line count: %d)",
+                 (long)(s_rx_timeout_us / 1000), (long)(want / 1000),
+                 (long)(s_learned_gap_us / 1000), (int)s_learned_line_count);
+        s_rx_timeout_us = want;
+    }
+#endif  /* CONFIG_NCLE_MA_ADAPTIVE_TIMEOUT */
 }
 
 /**
@@ -235,6 +374,8 @@ static void output_ma_data(void)
     // Output JSON to console
     puts(s_json_buffer);
 
+    timing_mark(TIMING_T2_APP_SENT);   // T2 - reading on its way to the app
+
     // Call data callback (for BLE transmission)
     if (s_data_callback) {
         s_data_callback(s_json_buffer, json_len);
@@ -246,6 +387,100 @@ static void output_ma_data(void)
     }
 
     s_stats.packet_count++;
+}
+
+/* ==================================================================
+ * AccuMilk / Tricom MacPro CC-Solar binary parser (model 5000-5999)
+ * ------------------------------------------------------------------
+ * The DPU sends a binary frame: 7E 3A <type> 01 <values> <csum> 06 A3 E7
+ *   - start 0x7E, end 0xA3 0xE7; type 0x17 = full reading, 0x1C = memid only
+ *   - each value's units digit has bit 0x80 set => decimal point after it
+ *   - fields in fixed order: Member, FAT, SNF, QTY, RATE, AMOUNT (no CLR)
+ * Converts to clean JSON instead of forwarding raw bytes. Validated
+ * against real MacPro captures.
+ * ================================================================== */
+#define ACCUMILK_MAX_DIGITS 64
+
+static float accumilk_marked_number(const char *dg, const bool *mk, int a, int b)
+{
+    int mark = -1;
+    for (int i = a; i < b; i++) { if (mk[i]) { mark = i; break; } }
+    if (mark < 0) mark = b - 1;
+    long ip = 0;
+    for (int i = a; i <= mark && i < b; i++) ip = ip * 10 + (dg[i] - '0');
+    float frac = 0.0f, div = 1.0f;
+    for (int i = mark + 1; i < b; i++) { frac = frac * 10.0f + (dg[i] - '0'); div *= 10.0f; }
+    return (float)ip + (div > 1.0f ? frac / div : 0.0f);
+}
+
+static float accumilk_value_1dp(const char *dg, const bool *mk, int *p, int end)
+{
+    int a = *p, mark = -1;
+    for (int i = a; i < end; i++) { if (mk[i]) { mark = i; break; } }
+    if (mark < 0) mark = a;
+    long ip = 0;
+    for (int i = a; i <= mark && i < end; i++) ip = ip * 10 + (dg[i] - '0');
+    int dec = (mark + 1 < end) ? (dg[mark + 1] - '0') : 0;
+    *p = mark + 2;
+    return (float)ip + dec / 10.0f;
+}
+
+// Parse a raw AccuMilk frame and output clean JSON. Returns true if a full
+// reading was decoded and sent; false otherwise (e.g. member-id-only frame).
+static bool process_accumilk(const char *raw, int raw_len)
+{
+    int s = -1, e = -1;
+    for (int i = 0; i < raw_len; i++) { if ((uint8_t)raw[i] == 0x7E) { s = i; break; } }
+    if (s < 0) return false;
+    for (int i = s + 1; i + 1 < raw_len; i++)
+        { if ((uint8_t)raw[i] == 0xA3 && (uint8_t)raw[i + 1] == 0xE7) { e = i; break; } }
+    if (e < 0 || (e - (s + 5)) < 1) return false;
+
+    uint8_t type = (uint8_t)raw[s + 2];
+    int vstart = s + 5, vend = e - 3;
+
+    char dg[ACCUMILK_MAX_DIGITS];
+    bool mk[ACCUMILK_MAX_DIGITS];
+    int tokstart[ACCUMILK_MAX_DIGITS];
+    int ntok = 0, n = 0;
+    bool intok = false;
+    for (int i = vstart; i <= vend && n < ACCUMILK_MAX_DIGITS; i++) {
+        uint8_t b = (uint8_t)raw[i];
+        if (b == 0x20) { intok = false; continue; }
+        uint8_t c = b & 0x7F;
+        if (c < '0' || c > '9') continue;
+        if (!intok) { tokstart[ntok++] = n; intok = true; }
+        dg[n] = c; mk[n] = (b & 0x80) != 0; n++;
+    }
+
+    int memid = 0, i = (ntok > 0) ? tokstart[0] : 0;
+    while (i < n && !mk[i]) { memid = memid * 10 + (dg[i] - '0'); i++; }
+
+    if (type != 0x17 || ntok < 3) return false;   // forward only full readings
+
+    int end0 = (ntok > 1) ? tokstart[1] : n;
+    float fat = accumilk_value_1dp(dg, mk, &i, end0);
+    float snf = accumilk_value_1dp(dg, mk, &i, end0);
+    int laststart = tokstart[ntok - 1];
+    int j = tokstart[1];
+    float qty = accumilk_value_1dp(dg, mk, &j, laststart);
+    float rate = accumilk_marked_number(dg, mk, j, laststart);
+    float amount = accumilk_marked_number(dg, mk, laststart, n);
+
+    if (amount > 0.0f && fabsf(qty * rate - amount) > 0.10f) return false;   // corrupt -> drop
+
+    int json_len = snprintf(s_json_buffer, sizeof(s_json_buffer),
+        "{\"device\":\"ma\",\"memid\":%d,\"fat\":%.1f,\"snf\":%.1f,"
+        "\"qty\":%.1f,\"rate\":%.2f,\"amount\":%.2f,\"model\":%d }",
+        memid, fat, snf, qty, rate, amount, s_model_id);
+
+    s_last_packet_time = esp_timer_get_time();
+    puts(s_json_buffer);
+    timing_mark(TIMING_T2_APP_SENT);   // T2 - reading on its way to the app
+    if (s_data_callback) s_data_callback(s_json_buffer, json_len);
+    if (s_activity_callback) s_activity_callback();
+    s_stats.packet_count++;
+    return true;
 }
 
 /**
@@ -264,24 +499,68 @@ static void process_ma_packet(void)
         }
         s_rx_index = 0;
         s_last_rx_time = 0;
+        // Discarded fragment - clear the measurement too, otherwise its short
+        // length/line count would pollute what the next frame learns.
+        s_max_gap_us = 0;
+        s_rx_line_count = 0;
         return;
     }
 
     s_rx_buffer[s_rx_index] = '\0';
 
+    // T1 - the frame is complete and about to be decoded.
+    timing_mark(TIMING_T1_MA_DONE);
+
     // Pico2W compatibility: Output MA data IMMEDIATELY (no duplicate detection)
     // MA receipts are always unique, so just output and trigger WM
     ESP_LOGI(TAG, "MA data received (%d bytes) - outputting immediately", (int)s_rx_index);
-    output_ma_data();
 
-    // Trigger WM to start receiving (Pico2W dairy workflow)
-    // MA reads milk → WM reads weight automatically
-    ESP_LOGI(TAG, "Triggering WM to start (dairy workflow)");
-    wm_uart_start();
+    // AccuMilk / Tricom binary DPU (model 5000-5999): parse into clean JSON.
+    // Falls back to raw passthrough if the frame can't be decoded.
+    if (s_model_id >= 5000 && s_model_id <= 5999 &&
+        process_accumilk(s_rx_buffer, (int)s_rx_index)) {
+        // parsed + sent clean JSON
+    } else {
+        output_ma_data();
+    }
+
+    // WM is now started on the MA's FIRST byte (see uart_rx_task) so it reads in
+    // parallel during the MA window; the settled weight is captured there and
+    // merged into the MA message's MQTT copy. No post-MA WM trigger needed here.
+
+    // MA-stage timing on the console, logged whether or not a receipt follows.
+    ESP_LOGI(TAG, "MA timing (ms): T0=%ld T1=%ld T2=%ld",
+             (long)timing_get_ms(TIMING_T0_MA_FIRST),
+             (long)timing_get_ms(TIMING_T1_MA_DONE),
+             (long)timing_get_ms(TIMING_T2_APP_SENT));
+
+    // Frame shape: size, and the longest pause the analyser left mid-frame.
+    // The timeout only has to outlast max_gap - everything beyond that is
+    // dead waiting, which is what update_rx_timeout() trims away.
+    ESP_LOGI(TAG, "MA frame: bytes=%d max_gap=%ldms (timeout was %ldms, newlines=%d)",
+             (int)s_rx_index,
+             (long)(s_max_gap_us / 1000),
+             (long)(s_rx_timeout_us / 1000),
+             (int)s_rx_line_count);
+
+    // Re-tune for the next frame, using this frame's pauses and length - only
+    // in TIMEOUT detection mode, where the idle gap is what ends a frame.
+    // PARENTHESES/NEWLINE modes end on a terminator, so they keep the ceiling.
+    if (s_detect_mode == MA_DETECT_TIMEOUT) {
+        update_rx_timeout(s_rx_index, s_rx_line_count);
+    } else {
+        s_rx_timeout_us = (int64_t)MA_RX_TIMEOUT_MS * 1000;
+        s_learned_gap_us = 0;
+        s_learned_frame_len = 0;
+        s_learned_line_count = 0;
+        s_consecutive_short_frames = 0;
+    }
 
     // Reset buffer
     s_rx_index = 0;
     s_last_rx_time = 0;
+    s_max_gap_us = 0;      // start the next frame's gap measurement clean
+    s_rx_line_count = 0;
 }
 
 /**
@@ -301,18 +580,52 @@ static void uart_rx_task(void *arg)
         // Check for timeout (all modes)
         if (s_rx_index > 0 && s_last_rx_time > 0) {
             int64_t now = esp_timer_get_time();
-            if ((now - s_last_rx_time) >= MA_RX_TIMEOUT_US) {
-                ESP_LOGI(TAG, "Timeout - processing %d bytes", (int)s_rx_index);
+            if ((now - s_last_rx_time) >= s_rx_timeout_us) {
+                // rx_span   = first byte -> now (receipt transmit + idle wait)
+                // idle_wait = last byte  -> now (this is the MA_RX_TIMEOUT_MS window)
+                ESP_LOGI(TAG, "Timeout - processing %d bytes (rx_span=%lldms, idle_wait=%lldms)",
+                         (int)s_rx_index,
+                         (long long)((now - s_first_rx_time) / 1000),
+                         (long long)((now - s_last_rx_time) / 1000));
                 process_ma_packet();
                 s_capturing = false;
             }
         }
 
         if (len > 0) {
-            s_last_rx_time = esp_timer_get_time();
+            // Track the biggest silence between chunks of the same frame.
+            // Only meaningful once we already hold part of a frame.
+            int64_t now_us = esp_timer_get_time();
+            if (s_rx_index > 0 && s_last_rx_time > 0) {
+                int64_t gap = now_us - s_last_rx_time;
+                if (gap > s_max_gap_us) {
+                    s_max_gap_us = gap;
+                }
+            }
+
+            if (s_rx_index == 0) {
+                // T0 - the analyser starting to talk begins a new cycle.
+                timing_mark(TIMING_T0_MA_FIRST);
+                // First byte of a new message - mark the start for timing.
+                s_first_rx_time = now_us;
+                // Tell whoever is listening that a frame has begun, and start
+                // WM reading in parallel. What the listener does with the event
+                // is not this driver's business - on the WiFi/GSM products it
+                // opens the weight-capture window so the weight is collected
+                // during the MA frame.
+                if (s_frame_start_callback) {
+                    s_frame_start_callback(s_detect_mode != MA_DETECT_TIMEOUT);
+                }
+                wm_uart_start();   // no-op if WM already running
+            }
+            s_last_rx_time = now_us;
 
             for (int i = 0; i < len; i++) {
                 uint8_t byte = rx_buffer[i];
+
+                if (byte == '\n') {
+                    s_rx_line_count++;
+                }
 
                 // Handle based on detection mode
                 switch (s_detect_mode) {
@@ -602,6 +915,11 @@ void ma_uart_set_data_callback(ma_data_callback_t callback)
 void ma_uart_set_activity_callback(ma_activity_callback_t callback)
 {
     s_activity_callback = callback;
+}
+
+void ma_uart_set_frame_start_callback(ma_frame_start_callback_t callback)
+{
+    s_frame_start_callback = callback;
 }
 
 void ma_uart_print_status(void)

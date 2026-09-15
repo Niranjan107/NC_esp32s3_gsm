@@ -68,6 +68,11 @@ extern "C" {
 // Data receive timeout (ms) - matches Pico2W MA_DATA_DELAY
 #define MA_RX_TIMEOUT_MS    3000
 
+// Floor for the adaptive receive timeout (see CONFIG_NCLE_MA_ADAPTIVE_TIMEOUT).
+// The driver never lowers the idle-gap wait below this, so a fast analyser is
+// not held up for the full 3 seconds after its last byte.
+#define MA_RX_TIMEOUT_MIN_MS 400
+
 // Minimum valid payload length
 #define MA_MIN_PAYLOAD_LEN  3
 
@@ -123,6 +128,25 @@ typedef void (*ma_data_callback_t)(const char *json_data, int len);
  * @brief Callback for activity indication (for LED)
  */
 typedef void (*ma_activity_callback_t)(void);
+
+/**
+ * @brief Callback for the FIRST byte of a new analyser frame.
+ *
+ * Fires the instant the analyser starts talking - before any of the frame has
+ * been decoded - which is the only moment a consumer can start something that
+ * must run *during* the reading (the weight-capture window does exactly that).
+ * The existing activity callback cannot serve: it fires when a reading is
+ * already COMPLETE.
+ *
+ * @param terminator_framed  true for analysers whose frames end on a terminator
+ *        (PARENTHESES 3xxx / NEWLINE 4xxx), false for idle-gap framed ones
+ *        (TIMEOUT 1xxx/2xxx/5xxx). Passed on every frame rather than announced
+ *        once at config time, so a consumer's copy can never go stale after a
+ *        model change.
+ *
+ * Runs on the MA RX task - keep the handler short and non-blocking.
+ */
+typedef void (*ma_frame_start_callback_t)(bool terminator_framed);
 
 // ============================================================================
 // Core Functions
@@ -228,6 +252,12 @@ void ma_uart_set_data_callback(ma_data_callback_t callback);
  * @param callback Callback function
  */
 void ma_uart_set_activity_callback(ma_activity_callback_t callback);
+
+/**
+ * @brief Register the frame-start callback (see ma_frame_start_callback_t)
+ * @param callback Callback function, or NULL to disable
+ */
+void ma_uart_set_frame_start_callback(ma_frame_start_callback_t callback);
 
 // ============================================================================
 // Status Functions

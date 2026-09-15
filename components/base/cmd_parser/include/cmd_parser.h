@@ -10,7 +10,9 @@
 #define _CMD_PARSER_H_
 
 #include <stddef.h>
+#include <stdbool.h>
 #include "esp_err.h"
+#include "cJSON.h"
 #include "common.h"
 
 #ifdef __cplusplus
@@ -42,16 +44,36 @@ extern "C" {
 #define CMD_SELF_DIAGNOSIS      "self_diagnosis"
 #define CMD_GET_BATTERY_STATUS  "get_battery_status"
 
-// GSM commands (only meaningful when CONFIG_NCLE_GSM_ENABLE=y)
-#define CMD_GSM_ENABLE          "gsm_enable"
-#define CMD_GSM_DISABLE         "gsm_disable"
-#define CMD_GSM_STATUS          "gsm_status"
-#define CMD_GSM_HTTP_POST       "gsm_http_post"
-#define CMD_GSM_HTTP_GET        "gsm_http_get"
-#define CMD_GSM_PING            "gsm_ping"
-#define CMD_GSM_GET_NUMBER      "gsm_get_number"
-#define CMD_GSM_SEND_TO_PRINT   "gsm_send_to_print" /* POST + print response (existing) */
-#define CMD_GSM_FETCH_PRINT     "gsm_fetch_print"   /* GET from server, print response */
+// WiFi commands (Stage 1: BLE provisioning)
+#define CMD_WIFI_CONFIG         "wifi_config"
+#define CMD_WIFI_STATUS         "wifi_status"
+#define CMD_WIFI_ERASE          "wifi_erase"
+
+// Diagnostics (on-demand): connectivity + counters + WM/MA/printer config
+#define CMD_DIAG                "diag"
+
+// Cycle timing instrumentation
+#define CMD_GET_CYCLE_TIMING    "get_cycle_timing"
+#define CMD_SET_TIMING_DEBUG    "set_timing_debug"
+
+// BLE reading delivery (auto / always / app / off) - see device_config.h
+// "app" also turns the flash buffer off and clears it.
+#define CMD_SET_BLE_DATA        "set_ble_data"
+#define CMD_GET_BLE_DATA        "get_ble_data"
+
+// Store-and-forward on/off (off only for permanently app-only sites)
+#define CMD_SET_STORE_FORWARD   "set_store_forward"
+
+// Offline buffer (store-and-forward) storage
+#define CMD_GET_STORAGE_INFO    "get_storage_info"
+#define CMD_CLEAR_BUFFER        "clear_buffer"
+
+// FOTA commands
+#define CMD_FOTA_START          "fota_start"
+#define CMD_FOTA_ROLLBACK       "fota_rollback"
+
+// FOTA parameter keys
+#define KEY_URL                 "url"
 
 /*******************************************************************************
  * Config Parameter Keys
@@ -64,6 +86,8 @@ extern "C" {
 #define KEY_PARITY              "parity"
 #define KEY_STREAM              "stream"
 #define KEY_DATA                "data"
+#define KEY_SSID                "ssid"
+#define KEY_PASSWORD            "password"
 
 /*******************************************************************************
  * Response Messages
@@ -85,23 +109,6 @@ extern "C" {
 #define RESP_COMMAND_NOT_FOUND          "command_not_found"
 #define RESP_UNDEFINED_COMMAND          "undefined_command"
 
-// GSM responses
-#define RESP_GSM_ENABLE_STARTED         "gsm_enable_started"
-#define RESP_GSM_ENABLE_FAILED          "gsm_enable_failed"
-#define RESP_GSM_DISABLE_STOPPED        "gsm_disable_stopped"
-#define RESP_GSM_NOT_ENABLED            "gsm_not_enabled"
-#define RESP_GSM_STATUS_OK              "gsm_status"
-#define RESP_GSM_HTTP_POST_OK           "gsm_http_post"
-#define RESP_GSM_HTTP_POST_FAIL         "gsm_http_post_fail"
-#define RESP_GSM_HTTP_GET_OK            "gsm_http_get"
-#define RESP_GSM_HTTP_GET_FAIL          "gsm_http_get_fail"
-#define RESP_GSM_PING_OK                "gsm_ping"
-#define RESP_GSM_PING_FAIL              "gsm_ping_fail"
-#define RESP_GSM_GET_NUMBER_OK          "gsm_get_number"
-#define RESP_GSM_GET_NUMBER_FAIL        "gsm_get_number_fail"
-#define RESP_GSM_SEND_TO_PRINT_OK       "gsm_send_to_print"
-#define RESP_GSM_SEND_TO_PRINT_FAIL     "gsm_send_to_print_fail"
-
 /*******************************************************************************
  * Type Definitions
  ******************************************************************************/
@@ -112,6 +119,24 @@ extern "C" {
  * @param len Length of data
  */
 typedef void (*cmd_output_callback_t)(const char *data, size_t len);
+
+/**
+ * @brief Handler for a command registered by another component.
+ *
+ * @param root the parsed command object; the handler must NOT delete it (the
+ *             parser owns it) and should reply with send_response().
+ */
+typedef void (*cmd_handler_t)(cJSON *root);
+
+/**
+ * @brief Where a command came from. Used to restrict risky commands to
+ * local/on-site channels (BLE/console) and block them from the cloud (MQTT).
+ */
+typedef enum {
+    CMD_SRC_BLE = 0,   /* local mobile app over BLE (trusted, on-site) */
+    CMD_SRC_CONSOLE,   /* local USB console (trusted, on-site) */
+    CMD_SRC_MQTT,      /* remote cloud/server over MQTT (restricted) */
+} cmd_source_t;
 
 /*******************************************************************************
  * Function Prototypes
@@ -130,14 +155,41 @@ esp_err_t cmd_parser_init(void);
 void cmd_parser_register_output_callback(cmd_output_callback_t callback);
 
 /**
+ * @brief Register a command owned by another component.
+ *
+ * Lets a component outside `base` add its own commands without this shared file
+ * learning what they are - `wifi_sta` registers wifi_config/wifi_status/
+ * wifi_erase this way, and the GSM product will register apn_config/sim_status
+ * the same way, so the parser stays identical across products.
+ *
+ * Dispatch order: every BUILT-IN command is tried first, and only then the
+ * registered ones. A registered command therefore can never shadow a base
+ * command, whatever name it picks.
+ *
+ * INPUT:
+ * @param command  command name; must be a string literal or otherwise outlive
+ *                 the program (it is stored by pointer, not copied)
+ * @param handler  called with the parsed JSON object when the command arrives
+ *
+ * OUTPUT:
+ * @return true if registered. false - and logged - if the arguments are NULL,
+ *         the name is already registered, or all CMD_REG_MAX slots are used.
+ */
+bool cmd_parser_register(const char *command, cmd_handler_t handler);
+
+/**
  * @brief Parse and process a JSON command string
  * @param json_str The JSON command string (null-terminated)
  * @param json_len Length of the JSON string
  *
  * Command format: {"command": "cmd_name", ...}
  * Commands are terminated with '#' character
+ *
+ * @param source Where the command came from (CMD_SRC_BLE/CONSOLE/MQTT).
+ *               Risky commands (wifi_config/wifi_erase/reset_config) are
+ *               rejected when source == CMD_SRC_MQTT.
  */
-void parse_and_process_commands(char *json_str, int json_len);
+void parse_and_process_commands(char *json_str, int json_len, cmd_source_t source);
 
 /**
  * @brief Send a response back to the app

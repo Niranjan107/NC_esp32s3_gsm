@@ -93,145 +93,24 @@
 #include "mbedtls/base64.h"
 #endif
 
-#ifdef CONFIG_NCLE_GSM_ENABLE
-#include "gsm.h"
-#include "gsm_task.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#ifdef CONFIG_NCLE_PRINTER_ENABLE
-#include "printer_uart.h"
+/* Application layer, present from Step 4 of the GSM port onwards. Every use of
+ * it below is already inside CONFIG_NCLE_MQTT_ENABLE, so the header is only
+ * needed when that layer exists. */
+#ifdef CONFIG_NCLE_MQTT_ENABLE
+#include "fota.h"
 #endif
 
-/* GSM op worker — runs on its own task so BLE callback (BTC_TASK) doesn't
- * block for 5-25s and so we have enough stack for the AT command chain. */
-typedef enum {
-    GSM_OP_HTTP_POST,
-    GSM_OP_HTTP_GET,
-    GSM_OP_PING,
-    GSM_OP_SEND_TO_PRINT,    /* POST + read response body + print it */
-} gsm_op_t;
+/* No connectivity header here, deliberately. This file is shared by every CLV4
+ * product, so it must not know whether the device has WiFi, GSM or neither: it
+ * asks net_link (base/common) which link is up and lets that link describe
+ * itself. The wifi_* commands live in the wifi_sta component and register
+ * themselves; the only WiFi text left below is two command NAMES in the MQTT
+ * restriction, which are compared as strings, not called. */
+#include "net_link.h"
 
-typedef struct {
-    gsm_op_t op;
-    char     url_or_host[256];     /* URL for HTTP, host for ping */
-    char     body[512];            /* used for HTTP POST */
-    uint8_t  ping_count;
-    uint16_t ping_timeout_s;
-} gsm_op_req_t;
-
-static void gsm_op_worker_task(void *arg)
-{
-    gsm_op_req_t *req = (gsm_op_req_t *)arg;
-    static char resp_body[256];
-    static char data[320];
-    int http_code = -1;
-    esp_err_t err = ESP_FAIL;
-    const char *resp_msg_ok = "";
-    const char *resp_msg_fail = "";
-
-    switch (req->op) {
-    case GSM_OP_HTTP_POST:
-        err = gsm_http_post(req->url_or_host, req->body, &http_code,
-                            resp_body, sizeof(resp_body));
-        snprintf(data, sizeof(data), "{\"http\":%d,\"resp_len\":%u}",
-                 http_code, (unsigned)strlen(resp_body));
-        resp_msg_ok   = RESP_GSM_HTTP_POST_OK;
-        resp_msg_fail = RESP_GSM_HTTP_POST_FAIL;
-        break;
-
-    case GSM_OP_HTTP_GET:
-        err = gsm_http_get(req->url_or_host, &http_code,
-                           resp_body, sizeof(resp_body));
-        snprintf(data, sizeof(data), "{\"http\":%d,\"resp_len\":%u}",
-                 http_code, (unsigned)strlen(resp_body));
-        resp_msg_ok   = RESP_GSM_HTTP_GET_OK;
-        resp_msg_fail = RESP_GSM_HTTP_GET_FAIL;
-        break;
-
-    case GSM_OP_PING: {
-        gsm_ping_result_t pr = {0};
-        err = gsm_ping(req->url_or_host, req->ping_count, req->ping_timeout_s, &pr);
-        snprintf(data, sizeof(data),
-                 "{\"reachable\":%d,\"sent\":%d,\"recv\":%d,\"loss_pct\":%d,"
-                 "\"rtt_avg\":%d,\"rtt_max\":%d}",
-                 (int)pr.reachable, pr.sent, pr.received, pr.loss_pct,
-                 pr.rtt_avg_ms, pr.rtt_max_ms);
-        resp_msg_ok   = RESP_GSM_PING_OK;
-        resp_msg_fail = RESP_GSM_PING_FAIL;
-        break;
-    }
-
-    case GSM_OP_SEND_TO_PRINT: {
-        /* POST the body to the URL, read response, send response body
-         * straight to the printer. The server controls exactly what gets
-         * printed by what it returns in the HTTP response body. */
-        err = gsm_http_post(req->url_or_host, req->body, &http_code,
-                            resp_body, sizeof(resp_body));
-        bool printed = false;
-        if (err == ESP_OK && http_code >= 200 && http_code < 300 &&
-            strlen(resp_body) > 0) {
-#ifdef CONFIG_NCLE_PRINTER_ENABLE
-            printed = printer_print_with_special_chars(resp_body);
-#endif
-        }
-        snprintf(data, sizeof(data),
-                 "{\"http\":%d,\"resp_len\":%u,\"printed\":%d}",
-                 http_code, (unsigned)strlen(resp_body), (int)printed);
-        resp_msg_ok   = RESP_GSM_SEND_TO_PRINT_OK;
-        resp_msg_fail = RESP_GSM_SEND_TO_PRINT_FAIL;
-        if (err == ESP_OK && !printed) err = ESP_FAIL;
-        break;
-    }
-    }
-
-    send_response(err == ESP_OK ? resp_msg_ok : resp_msg_fail,
-                  err == ESP_OK ? STATUS_OK   : STATUS_ERR, data);
-
-    free(req);
-    vTaskDelete(NULL);
-}
-
-static esp_err_t spawn_op_worker(gsm_op_req_t *req)
-{
-    BaseType_t ok = xTaskCreate(gsm_op_worker_task, "gsm_op_w",
-                                8192, req, 4, NULL);
-    if (ok != pdPASS) {
-        free(req);
-        return ESP_FAIL;
-    }
-    return ESP_OK;
-}
-
-static esp_err_t spawn_http_worker(const char *url, const char *body, bool is_post)
-{
-    gsm_op_req_t *req = (gsm_op_req_t *)calloc(1, sizeof(*req));
-    if (req == NULL) return ESP_ERR_NO_MEM;
-    req->op = is_post ? GSM_OP_HTTP_POST : GSM_OP_HTTP_GET;
-    strncpy(req->url_or_host, url, sizeof(req->url_or_host) - 1);
-    if (body) strncpy(req->body, body, sizeof(req->body) - 1);
-    return spawn_op_worker(req);
-}
-
-static esp_err_t spawn_ping_worker(const char *host, uint8_t count, uint16_t timeout_s)
-{
-    gsm_op_req_t *req = (gsm_op_req_t *)calloc(1, sizeof(*req));
-    if (req == NULL) return ESP_ERR_NO_MEM;
-    req->op = GSM_OP_PING;
-    if (host) strncpy(req->url_or_host, host, sizeof(req->url_or_host) - 1);
-    req->ping_count     = count;
-    req->ping_timeout_s = timeout_s;
-    return spawn_op_worker(req);
-}
-
-static esp_err_t spawn_print_worker(const char *url, const char *body)
-{
-    gsm_op_req_t *req = (gsm_op_req_t *)calloc(1, sizeof(*req));
-    if (req == NULL) return ESP_ERR_NO_MEM;
-    req->op = GSM_OP_SEND_TO_PRINT;
-    strncpy(req->url_or_host, url, sizeof(req->url_or_host) - 1);
-    if (body) strncpy(req->body, body, sizeof(req->body) - 1);
-    return spawn_op_worker(req);
-}
+#ifdef CONFIG_NCLE_MQTT_ENABLE
+#include "mqtt_client_svc.h"
+#include "store_forward.h"   /* storage info + clear for the buffer commands */
 #endif
 
 static const char *TAG = "CMD_PARSER";
@@ -255,6 +134,34 @@ static const char *TAG = "CMD_PARSER";
  * Used by: send_response() to send JSON responses via BLE
  */
 static cmd_output_callback_t s_output_callback = NULL;
+
+/**
+ * Registered Commands
+ * PURPOSE: commands owned by components OUTSIDE base, so this shared file never
+ * learns what they are.
+ *
+ * WHY?
+ * wifi_config/wifi_status/wifi_erase used to live in the dispatch chain below,
+ * which meant this base component - supposedly identical in every CLV4 product -
+ * knew about WiFi. The GSM product would then have added apn_config/sim_status
+ * to the same chain and base would become a drawer holding every product's
+ * commands. Now connectivity registers its own; base stays variant-free.
+ *
+ * Fixed table, no allocation. Registration happens once during startup, before
+ * any command can arrive, so no locking is needed.
+ *
+ * Set by: cmd_parser_register(), called from each connectivity component's init
+ * Used by: parse_and_process_commands(), AFTER every built-in command is tried
+ */
+#define CMD_REG_MAX 8
+
+typedef struct {
+    const char   *name;
+    cmd_handler_t handler;
+} cmd_reg_t;
+
+static cmd_reg_t s_registry[CMD_REG_MAX];
+static int       s_registry_count = 0;
 
 /**
  * Response Buffer
@@ -282,6 +189,7 @@ static void process_get_current_config(void);     /* Handle get_current_config c
 static void process_get_unique_id(void);          /* Handle ncle_get_unique_id command */
 static void process_get_firmware_version(void);   /* Handle get_firmware_version command */
 static void process_self_diagnosis(void);         /* Handle self_diagnosis command */
+static void process_diag(void);                   /* Handle diag command (connectivity + config) */
 
 /*******************************************************************************
  * Public Functions
@@ -307,6 +215,19 @@ esp_err_t cmd_parser_init(void)
 {
     ESP_LOGI(TAG, "Command parser initialized");
     s_output_callback = NULL;
+
+    // Populate g_device_config from NVS so get_current_config reports the
+    // saved configuration after a reboot (defaults first, then any saved
+    // values on top). The UART modules load their own NVS separately.
+    config_load_defaults(&g_device_config);
+    config_load_from_nvs(&g_device_config);
+
+    // Print the loaded config to the console at boot so the current
+    // configuration is visible without sending get_current_config.
+    char cfg_json[RESPONSE_BUF_SIZE];
+    config_get_json(cfg_json, sizeof(cfg_json));
+    ESP_LOGI(TAG, "Loaded config: %s", cfg_json);
+
     return ESP_OK;
 }
 
@@ -387,6 +308,33 @@ void send_response(const char *msg, int status_code, const char *data)
 }
 
 /**
+ * @brief Register a command owned by a component outside base. See cmd_parser.h.
+ */
+bool cmd_parser_register(const char *command, cmd_handler_t handler)
+{
+    if (command == NULL || handler == NULL) {
+        ESP_LOGE(TAG, "register: NULL command or handler");
+        return false;
+    }
+    if (s_registry_count >= CMD_REG_MAX) {
+        ESP_LOGE(TAG, "register: table full, '%s' not registered", command);
+        return false;
+    }
+    for (int i = 0; i < s_registry_count; i++) {
+        if (strcmp(s_registry[i].name, command) == 0) {
+            ESP_LOGW(TAG, "register: '%s' already registered", command);
+            return false;
+        }
+    }
+
+    s_registry[s_registry_count].name    = command;
+    s_registry[s_registry_count].handler = handler;
+    s_registry_count++;
+    ESP_LOGI(TAG, "Registered command '%s'", command);
+    return true;
+}
+
+/**
  * @brief Send status (alias for send_response)
  *
  * PURPOSE:
@@ -446,7 +394,7 @@ void send_status(const char *msg, int status_code, const char *data)
  *
  * CALLED FROM: process_ble_rx_data() in ble_spp.c
  */
-void parse_and_process_commands(char *json_str, int json_len)
+void parse_and_process_commands(char *json_str, int json_len, cmd_source_t source)
 {
     // Parse JSON
     cJSON *root = cJSON_ParseWithLength(json_str, json_len);
@@ -468,6 +416,30 @@ void parse_and_process_commands(char *json_str, int json_len)
 
     const char *cmd = cmd_item->valuestring;
     ESP_LOGI(TAG, "Processing command: %s", cmd);
+
+    /* Restrict risky commands to local channels (BLE / USB console). These can
+     * disconnect the device from its network or wipe its setup, so they must
+     * NOT be triggerable remotely from the cloud (MQTT). Gated by a menuconfig
+     * flag (NCLE_MQTT_RESTRICT_RISKY_CMDS, default on) so it can be toggled
+     * without code changes. */
+#ifdef CONFIG_NCLE_MQTT_RESTRICT_RISKY_CMDS
+    if (source == CMD_SRC_MQTT &&
+        (strcmp(cmd, CMD_WIFI_CONFIG) == 0 ||
+         strcmp(cmd, CMD_WIFI_ERASE)  == 0 ||
+         strcmp(cmd, CMD_RESET_CONFIG) == 0 ||
+         /* set_ble_data decides whether the app sees readings at all. Allowing
+          * it from the cloud would let one bad command blind every device in
+          * the field, with no local way to notice. BLE/console only. */
+         strcmp(cmd, CMD_SET_BLE_DATA) == 0 ||
+         /* set_store_forward turns OFF the never-lose-a-reading guarantee. It
+          * is a per-site installation decision, not a remote one. */
+         strcmp(cmd, CMD_SET_STORE_FORWARD) == 0)) {
+        ESP_LOGW(TAG, "Command '%s' blocked over MQTT (BLE/console only)", cmd);
+        send_response("command_not_allowed_remotely", STATUS_ERR, NULL);
+        cJSON_Delete(root);
+        return;
+    }
+#endif
 
     // Command dispatch
     if (strcmp(cmd, CMD_RESET_CONFIG) == 0) {
@@ -509,6 +481,18 @@ void parse_and_process_commands(char *json_str, int json_len)
         send_response("battery_not_enabled", STATUS_ERR, NULL);
 #endif
     }
+    /*-------------------------------------------------------------------------
+     * NOTE: wifi_config / wifi_status / wifi_erase used to be handled here.
+     * They now live in the wifi_sta component (connectivity layer), which
+     * registers them via cmd_parser_register() at startup - see the registry
+     * lookup in the final `else` below. This file is shared by every CLV4
+     * product, so it must not know which transport a product happens to have.
+     * The MQTT restriction on the risky two stays here: it matches on the
+     * command NAME before dispatch, so it is unaffected by where they live.
+     *-----------------------------------------------------------------------*/
+    else if (strcmp(cmd, CMD_DIAG) == 0) {
+        process_diag();
+    }
     else if (strcmp(cmd, CMD_PRINT_RECEIPT) == 0) {
 #ifdef CONFIG_NCLE_PRINTER_ENABLE
         // Extract receipt data from JSON
@@ -517,8 +501,15 @@ void parse_and_process_commands(char *json_str, int json_len)
             ESP_LOGE(TAG, "Missing 'data' field for print_receipt");
             send_response("print_receipt_fail", STATUS_ERR, NULL);
         } else {
+            // T3 - the app's print data is back. mark_once so the FIRST chunk
+            // of a multi-chunk receipt sets it, not the last.
+            timing_mark_once(TIMING_T3_CMD_RX);
             const char *receipt_data = data_item->valuestring;
             ESP_LOGI(TAG, "Printing receipt (%d bytes)", (int)strlen(receipt_data));
+            // Echo the exact receipt content to the console for debugging: if
+            // this shows but the paper is blank, the data arrived fine and the
+            // fault is the printer/hardware (not the WM/MA/cloud path).
+            ESP_LOGI(TAG, "Receipt content >>>\n%s\n<<< end receipt", receipt_data);
             if (printer_print_with_special_chars(receipt_data)) {
                 send_response("print_receipt_success", STATUS_OK, NULL);
             } else {
@@ -647,185 +638,253 @@ void parse_and_process_commands(char *json_str, int json_len)
         send_response("ota_not_enabled", STATUS_ERR, NULL);
 #endif
     }
-    /*-------------------------------------------------------------------------
-     * GSM Commands
-     * gsm_enable  : start the GSM task (init modem, begin status polling)
-     * gsm_disable : stop the GSM task (power off modem)
-     * gsm_status  : return cached status snapshot (alive/registered/rssi/bars/net)
-     *-----------------------------------------------------------------------*/
-    else if (strcmp(cmd, CMD_GSM_ENABLE) == 0) {
-#ifdef CONFIG_NCLE_GSM_ENABLE
-        esp_err_t err = gsm_task_start();
-        /* Persist, so a device re-enabled by hand also comes back after a
-         * power cycle - the mirror of gsm_disable below. */
-        if (err == ESP_OK) gsm_set_enabled_pref(true);
-        send_response(err == ESP_OK ? RESP_GSM_ENABLE_STARTED
-                                    : RESP_GSM_ENABLE_FAILED,
-                      err == ESP_OK ? STATUS_OK : STATUS_ERR, NULL);
-#else
-        send_response(RESP_GSM_NOT_ENABLED, STATUS_ERR, NULL);
-#endif
-    }
-    else if (strcmp(cmd, CMD_GSM_DISABLE) == 0) {
-#ifdef CONFIG_NCLE_GSM_ENABLE
-        gsm_task_stop();
-        /* Persist the choice: with auto-start enabled, a preference held only
-         * in RAM would be undone at the next reboot. */
-        gsm_set_enabled_pref(false);
-        send_response(RESP_GSM_DISABLE_STOPPED, STATUS_OK, NULL);
-#else
-        send_response(RESP_GSM_NOT_ENABLED, STATUS_ERR, NULL);
-#endif
-    }
-    else if (strcmp(cmd, CMD_GSM_STATUS) == 0) {
-#ifdef CONFIG_NCLE_GSM_ENABLE
-        gsm_status_t s;
-        gsm_task_get_last_status(&s);
-        static char gsm_resp[160];
-        snprintf(gsm_resp, sizeof(gsm_resp),
-                 "{\"alive\":%d,\"registered\":%d,\"rssi\":%d,\"bars\":%d,\"net\":%d}",
-                 s.alive, s.registered, s.rssi, s.bars, (int)s.net_status);
-        send_response(RESP_GSM_STATUS_OK, STATUS_OK, gsm_resp);
-#else
-        send_response(RESP_GSM_NOT_ENABLED, STATUS_ERR, NULL);
-#endif
-    }
-    /*-------------------------------------------------------------------------
-     * GSM HTTP POST  (testing/verification command)
-     * Usage: {"command":"gsm_http_post","url":"https://...","body":"<json>"}
-     * Response data: {"http":<code>,"resp":"<server reply, truncated>"}
-     *
-     * Requires gsm_task to be running and modem registered.
-     *-----------------------------------------------------------------------*/
-    else if (strcmp(cmd, CMD_GSM_HTTP_POST) == 0) {
-#ifdef CONFIG_NCLE_GSM_ENABLE
-        cJSON *url_item  = cJSON_GetObjectItem(root, "url");
-        cJSON *body_item = cJSON_GetObjectItem(root, "body");
-        if (!url_item || !cJSON_IsString(url_item)) {
-            send_response(RESP_GSM_HTTP_POST_FAIL, STATUS_ERR, "\"missing url\"");
-        } else {
-            const char *url  = url_item->valuestring;
-            const char *body = (body_item && cJSON_IsString(body_item)) ? body_item->valuestring : "";
-            esp_err_t serr = spawn_http_worker(url, body, true);
-            if (serr == ESP_OK) {
-                /* Ack immediately. Real result follows asynchronously
-                 * once the worker task finishes the HTTP roundtrip. */
-                send_response("gsm_http_post_queued", STATUS_OK, NULL);
-            } else {
-                send_response(RESP_GSM_HTTP_POST_FAIL, STATUS_ERR, "\"spawn failed\"");
-            }
-        }
-#else
-        send_response(RESP_GSM_NOT_ENABLED, STATUS_ERR, NULL);
-#endif
-    }
-    else if (strcmp(cmd, CMD_GSM_HTTP_GET) == 0) {
-#ifdef CONFIG_NCLE_GSM_ENABLE
-        cJSON *url_item = cJSON_GetObjectItem(root, "url");
-        if (!url_item || !cJSON_IsString(url_item)) {
-            send_response(RESP_GSM_HTTP_GET_FAIL, STATUS_ERR, "\"missing url\"");
+    else if (strcmp(cmd, CMD_FOTA_START) == 0) {
+/* FOTA lives in application/, which the GSM product gains in Step 4 - it is not
+ * part of the OTA component, so CONFIG_NCLE_OTA_ENABLE alone is not enough to
+ * know it exists. */
+#if defined(CONFIG_NCLE_OTA_ENABLE) && defined(CONFIG_NCLE_MQTT_ENABLE)
+        cJSON *url_item = cJSON_GetObjectItem(root, KEY_URL);
+        if (url_item == NULL || !cJSON_IsString(url_item)) {
+            send_response("fota_start", STATUS_ERR, "\"missing url\"");
         } else {
             const char *url = url_item->valuestring;
-            esp_err_t serr = spawn_http_worker(url, NULL, false);
-            if (serr == ESP_OK) {
-                send_response("gsm_http_get_queued", STATUS_OK, NULL);
+            esp_err_t err = fota_start(url);
+            if (err == ESP_OK) {
+                send_response("fota_start", STATUS_OK, "{\"state\":\"started\"}");
+            } else if (err == ESP_ERR_INVALID_STATE) {
+                send_response("fota_start", STATUS_ERR, "\"fota_start_fail_busy\"");
             } else {
-                send_response(RESP_GSM_HTTP_GET_FAIL, STATUS_ERR, "\"spawn failed\"");
+                send_response("fota_start", STATUS_ERR, "\"start failed\"");
             }
         }
 #else
-        send_response(RESP_GSM_NOT_ENABLED, STATUS_ERR, NULL);
+        send_response("ota_not_enabled", STATUS_ERR, NULL);
 #endif
     }
     /*-------------------------------------------------------------------------
-     * GSM Ping (verify data plan is actually working — IP-level reachability)
-     * Usage: {"command":"gsm_ping"}                       (defaults: 8.8.8.8, 4 pings)
-     *        {"command":"gsm_ping","host":"1.1.1.1"}
-     *        {"command":"gsm_ping","host":"...","count":4,"timeout":5}
-     * Response: {"reachable":1,"sent":4,"recv":4,"loss_pct":0,"rtt_avg":53,"rtt_max":57}
-     *-----------------------------------------------------------------------*/
-    /*-------------------------------------------------------------------------
-     * GSM Get Phone Number  (reads SIM MSISDN via AT+CNUM, plus ICCID)
-     * Usage: {"command":"gsm_get_number"}
-     * Response data: {"number":"+918...","iccid":"8991..."}
+     * Offline buffer storage
      *
-     * Note: many SIMs do not have MSISDN provisioned; "number" may be empty.
-     * ICCID (SIM serial) is always available.
+     * JSON: {"command":"get_storage_info"}#
+     *       {"command":"clear_buffer","confirm":true}#
      *-----------------------------------------------------------------------*/
-    else if (strcmp(cmd, CMD_GSM_GET_NUMBER) == 0) {
-#ifdef CONFIG_NCLE_GSM_ENABLE
-        char number[32] = {0};
-        char iccid[32]  = {0};
-        esp_err_t nerr = gsm_get_phone_number(number, sizeof(number));
-        esp_err_t ierr = gsm_get_iccid(iccid, sizeof(iccid));
-        static char data[128];
-        snprintf(data, sizeof(data),
-                 "{\"number\":\"%s\",\"iccid\":\"%s\"}",
-                 (nerr == ESP_OK) ? number : "",
-                 (ierr == ESP_OK) ? iccid  : "");
-        /* Success if we got at least the ICCID — number is optional */
-        bool ok = (ierr == ESP_OK) || (nerr == ESP_OK);
-        send_response(ok ? RESP_GSM_GET_NUMBER_OK : RESP_GSM_GET_NUMBER_FAIL,
-                      ok ? STATUS_OK : STATUS_ERR, data);
+    else if (strcmp(cmd, CMD_GET_STORAGE_INFO) == 0) {
+#ifdef CONFIG_NCLE_MQTT_ENABLE
+        sf_info_t si;
+        sf_get_info(&si);
+        static char storage_data[256];
+        snprintf(storage_data, sizeof(storage_data),
+                 "{\"total_bytes\":%lu,\"used_bytes\":%lu,\"free_bytes\":%lu,"
+                 "\"used_pct\":%u,\"records\":%lu,\"capacity_left\":%lu,\"evicted\":%lu}",
+                 (unsigned long)si.total_bytes, (unsigned long)si.used_bytes,
+                 (unsigned long)si.free_bytes, (unsigned)si.used_pct,
+                 (unsigned long)si.records, (unsigned long)si.capacity_left,
+                 (unsigned long)si.evicted);
+        send_response("get_storage_info", STATUS_OK, storage_data);
 #else
-        send_response(RESP_GSM_NOT_ENABLED, STATUS_ERR, NULL);
+        send_response("get_storage_info", STATUS_ERR, "\"mqtt_not_enabled\"");
+#endif
+    }
+    else if (strcmp(cmd, CMD_CLEAR_BUFFER) == 0) {
+#ifdef CONFIG_NCLE_MQTT_ENABLE
+        /* Destructive: these are milk readings the server has never received.
+         * The explicit confirm flag means a stray or mis-tapped message cannot
+         * wipe a collection centre's unsent data. */
+        cJSON *confirm = cJSON_GetObjectItem(root, "confirm");
+        if (confirm == NULL || !cJSON_IsTrue(confirm)) {
+            send_response("clear_buffer", STATUS_ERR, "\"confirm_required\"");
+        } else {
+            uint32_t deleted = sf_clear_all();
+            static char cleared[64];
+            snprintf(cleared, sizeof(cleared), "{\"deleted\":%lu}",
+                     (unsigned long)deleted);
+            send_response("clear_buffer", STATUS_OK, cleared);
+        }
+#else
+        send_response("clear_buffer", STATUS_ERR, "\"mqtt_not_enabled\"");
 #endif
     }
     /*-------------------------------------------------------------------------
-     * GSM Send-to-Print  (full IoT round-trip: POST data, print response)
-     * Usage: {"command":"gsm_send_to_print","url":"https://your-aws-endpoint/receipt","body":"{\"weight\":\"1.225\",\"fat\":\"4.1\"}"}
+     * Cycle Timing Instrumentation
+     * Reports how long one collection cycle took and where the time went.
      *
-     * Behavior:
-     *   1. POST <body> to <url> over HTTPS
-     *   2. Read HTTP response body
-     *   3. Send response body raw to printer (server controls what gets printed)
-     *
-     * Response: {"http":<code>,"resp_len":<bytes>,"printed":<0|1>}
+     * JSON: {"command":"get_cycle_timing"}#
+     *       {"command":"set_timing_debug","enable":1}#
      *-----------------------------------------------------------------------*/
-    else if (strcmp(cmd, CMD_GSM_SEND_TO_PRINT) == 0) {
-#ifdef CONFIG_NCLE_GSM_ENABLE
-        cJSON *url_item  = cJSON_GetObjectItem(root, "url");
-        cJSON *body_item = cJSON_GetObjectItem(root, "body");
-        if (!url_item || !cJSON_IsString(url_item)) {
-            send_response(RESP_GSM_SEND_TO_PRINT_FAIL, STATUS_ERR, "\"missing url\"");
+    else if (strcmp(cmd, CMD_GET_CYCLE_TIMING) == 0) {
+        int32_t t1 = timing_get_ms(TIMING_T1_MA_DONE);
+        int32_t t2 = timing_get_ms(TIMING_T2_APP_SENT);
+        int32_t t3 = timing_get_ms(TIMING_T3_CMD_RX);
+        int32_t t4 = timing_get_ms(TIMING_T4_PRINT_FIRST);
+        int32_t t5 = timing_get_ms(TIMING_T5_PRINT_DONE);
+        static char timing_data[288];
+        snprintf(timing_data, sizeof(timing_data),
+                 "{\"t0\":%ld,\"t1\":%ld,\"t2\":%ld,\"t3\":%ld,\"t4\":%ld,\"t5\":%ld,"
+                 "\"wm\":%ld,"
+                 "\"ma_rx\":%ld,\"app_gap\":%ld,\"print\":%ld,\"total\":%ld}",
+                 (long)timing_get_ms(TIMING_T0_MA_FIRST),
+                 (long)t1, (long)t2, (long)t3, (long)t4, (long)t5,
+                 (long)timing_get_ms(TIMING_WM_RX),
+                 (long)t1,                                              // T1-T0
+                 (long)((t3 >= 0 && t2 >= 0) ? (t3 - t2) : -1),         // T3-T2
+                 (long)((t5 >= 0 && t4 >= 0) ? (t5 - t4) : -1),         // T5-T4
+                 (long)t5);                                             // T5-T0
+        send_response("get_cycle_timing", STATUS_OK, timing_data);
+    }
+    else if (strcmp(cmd, CMD_SET_TIMING_DEBUG) == 0) {
+        cJSON *enable = cJSON_GetObjectItem(root, "enable");
+        if (enable == NULL) {
+            send_response("set_timing_debug", STATUS_ERR, "\"missing enable\"");
         } else {
-            const char *url  = url_item->valuestring;
-            const char *body = (body_item && cJSON_IsString(body_item)) ? body_item->valuestring : "";
-            esp_err_t serr = spawn_print_worker(url, body);
-            if (serr == ESP_OK) {
-                send_response("gsm_send_to_print_queued", STATUS_OK, NULL);
+            bool on = (enable->valueint != 0);
+            timing_set_receipt_print(on);
+            send_response("set_timing_debug", STATUS_OK,
+                          on ? "{\"receipt_timing\":true}" : "{\"receipt_timing\":false}");
+        }
+    }
+    /*-------------------------------------------------------------------------
+     * BLE reading delivery - ONE command controls where readings go.
+     * Readings always go to MQTT; this decides the BLE copy and, for "app",
+     * whether they are buffered to flash as well.
+     *
+     *   auto   - BLE readings only while the broker is DOWN (default). Once
+     *            the cloud is carrying them the app stops receiving, so the
+     *            server is not sent the same reading twice. Buffer ON.
+     *   always - both paths at once (behaviour before 2.0.0.1005). Buffer ON.
+     *   app    - BLE always, and the flash buffer OFF. For a site where the
+     *            mobile app is the delivery path: buffering there would fill
+     *            the ~2800-record buffer over a few weeks and then evict in a
+     *            loop, because nothing on this device will ever deliver it.
+     *   off    - never over BLE. Buffer ON.
+     *
+     * "app" is the only mode that touches the buffer, and it is why the buffer
+     * is set here rather than left to a second command: the two are wanted as a
+     * pair, and setting one without the other fails silently.
+     *
+     * Command replies are unaffected and always go over BLE.
+     *
+     * JSON: {"command":"set_ble_data","mode":"app"}#
+     *       {"command":"get_ble_data"}#
+     *-----------------------------------------------------------------------*/
+    else if (strcmp(cmd, CMD_SET_BLE_DATA) == 0) {
+        cJSON *mode = cJSON_GetObjectItem(root, "mode");
+        if (!cJSON_IsString(mode)) {
+            send_response("set_ble_data", STATUS_ERR, "\"missing mode\"");
+        } else {
+            uint8_t m;
+            bool buffer_on = true;      /* only "app" turns the buffer off */
+            if      (strcmp(mode->valuestring, "auto")   == 0) m = BLE_DATA_AUTO;
+            else if (strcmp(mode->valuestring, "always") == 0) m = BLE_DATA_ALWAYS;
+            else if (strcmp(mode->valuestring, "off")    == 0) m = BLE_DATA_OFF;
+            else if (strcmp(mode->valuestring, "app")    == 0) {
+                m = BLE_DATA_ALWAYS;
+                buffer_on = false;
+            }
+            else {
+                send_response("set_ble_data", STATUS_ERR, "\"invalid mode\"");
+                goto ble_data_done;
+            }
+            config_set_store_forward(buffer_on);
+
+            /* Turning the buffer off strands whatever is already in it: with
+             * no buffering there is no flush loop pass that will ever clear
+             * those files, so they would sit in flash forever. Delete the
+             * DATA only - meter/printer/WiFi configuration is untouched. */
+            unsigned long cleared = 0;
+#ifdef CONFIG_NCLE_MQTT_ENABLE
+            if (!buffer_on) {
+                cleared = (unsigned long)sf_clear_all();
+                ESP_LOGW(TAG, "Buffer disabled -> cleared %lu stranded reading(s)",
+                         cleared);
+            }
+#endif
+
+            if (config_set_ble_data_mode(m) == ESP_OK) {
+                static char bd[104];
+                snprintf(bd, sizeof(bd),
+                         "{\"mode\":\"%s\",\"store_forward\":%s,\"cleared\":%lu}",
+                         mode->valuestring, buffer_on ? "true" : "false", cleared);
+                ESP_LOGW(TAG, "BLE reading delivery '%s' (buffer %s)",
+                         mode->valuestring, buffer_on ? "on" : "OFF");
+                send_response("set_ble_data_success", STATUS_OK, bd);
             } else {
-                send_response(RESP_GSM_SEND_TO_PRINT_FAIL, STATUS_ERR, "\"spawn failed\"");
+                send_response("set_ble_data", STATUS_ERR, "\"save failed\"");
             }
         }
-#else
-        send_response(RESP_GSM_NOT_ENABLED, STATUS_ERR, NULL);
-#endif
+    ble_data_done: ;
     }
-    else if (strcmp(cmd, CMD_GSM_PING) == 0) {
-#ifdef CONFIG_NCLE_GSM_ENABLE
-        cJSON *host_item    = cJSON_GetObjectItem(root, "host");
-        cJSON *count_item   = cJSON_GetObjectItem(root, "count");
-        cJSON *timeout_item = cJSON_GetObjectItem(root, "timeout");
-        const char *host    = (host_item && cJSON_IsString(host_item))
-                              ? host_item->valuestring : "8.8.8.8";
-        uint8_t  count      = (count_item && cJSON_IsNumber(count_item))
-                              ? (uint8_t)count_item->valueint : 4;
-        uint16_t timeout_s  = (timeout_item && cJSON_IsNumber(timeout_item))
-                              ? (uint16_t)timeout_item->valueint : 5;
-        esp_err_t serr = spawn_ping_worker(host, count, timeout_s);
-        if (serr == ESP_OK) {
-            send_response("gsm_ping_queued", STATUS_OK, NULL);
+    /*-------------------------------------------------------------------------
+     * Store-and-forward on/off
+     * OFF only for a site that will never have WiFi, where the mobile app is
+     * the delivery path. Buffering there fills the ~2800-record buffer over a
+     * few weeks and then evicts in a loop for no benefit.
+     *
+     * Leave it ON anywhere WiFi exists, even intermittently - it is what makes
+     * a reading survive an outage.
+     *
+     * JSON: {"command":"set_store_forward","enable":0}#
+     *-----------------------------------------------------------------------*/
+    else if (strcmp(cmd, CMD_SET_STORE_FORWARD) == 0) {
+        cJSON *enable = cJSON_GetObjectItem(root, "enable");
+        if (enable == NULL) {
+            send_response("set_store_forward", STATUS_ERR, "\"missing enable\"");
         } else {
-            send_response(RESP_GSM_PING_FAIL, STATUS_ERR, "\"spawn failed\"");
+            bool on = cJSON_IsBool(enable) ? cJSON_IsTrue(enable)
+                                           : (enable->valueint != 0);
+            if (config_set_store_forward(on) == ESP_OK) {
+                ESP_LOGW(TAG, "Store-and-forward %s", on ? "ENABLED" : "DISABLED");
+                send_response("set_store_forward_success", STATUS_OK,
+                              on ? "{\"store_forward\":true}"
+                                 : "{\"store_forward\":false}");
+            } else {
+                send_response("set_store_forward", STATUS_ERR, "\"save failed\"");
+            }
+        }
+    }
+    else if (strcmp(cmd, CMD_GET_BLE_DATA) == 0) {
+        /* Report "app" rather than "always" when the buffer is also off, so
+         * what comes back matches what was set. */
+        uint8_t bd_m = config_get_ble_data_mode();
+        bool    sf_o = config_get_store_forward();
+        const char *name = (bd_m == BLE_DATA_ALWAYS && !sf_o)
+                               ? "app" : config_ble_data_mode_name(bd_m);
+        static char bd[80];
+        snprintf(bd, sizeof(bd), "{\"mode\":\"%s\",\"store_forward\":%s}",
+                 name, sf_o ? "true" : "false");
+        send_response("get_ble_data", STATUS_OK, bd);
+    }
+    else if (strcmp(cmd, CMD_FOTA_ROLLBACK) == 0) {
+/* Same as fota_start above: FOTA arrives with application/ in Step 4. */
+#if defined(CONFIG_NCLE_OTA_ENABLE) && defined(CONFIG_NCLE_MQTT_ENABLE)
+        esp_err_t err = fota_rollback();
+        if (err == ESP_OK) {
+            send_response("fota_rollback", STATUS_OK, "{\"state\":\"rolling_back\"}");
+        } else if (err == ESP_ERR_NOT_FOUND) {
+            send_response("fota_rollback", STATUS_ERR, "\"no_previous_firmware\"");
+        } else {
+            send_response("fota_rollback", STATUS_ERR, "\"rollback_failed\"");
         }
 #else
-        send_response(RESP_GSM_NOT_ENABLED, STATUS_ERR, NULL);
+        send_response("ota_not_enabled", STATUS_ERR, NULL);
 #endif
     }
     else {
-        ESP_LOGW(TAG, "Unknown command: %s", cmd);
-        send_response(RESP_UNDEFINED_COMMAND, STATUS_ERR, NULL);
+        /* Not a built-in command. Before giving up, check the commands other
+         * components registered (wifi_sta's wifi_* today, the GSM component's
+         * own later). Deliberately LAST: every built-in branch above has
+         * already been tried, so a registered command can never shadow a base
+         * command whatever name it picks. */
+        bool handled = false;
+        for (int i = 0; i < s_registry_count; i++) {
+            if (strcmp(cmd, s_registry[i].name) == 0) {
+                s_registry[i].handler(root);
+                handled = true;
+                break;
+            }
+        }
+        if (!handled) {
+            ESP_LOGW(TAG, "Unknown command: %s", cmd);
+            send_response(RESP_UNDEFINED_COMMAND, STATUS_ERR, NULL);
+        }
     }
 
     // Cleanup
@@ -922,6 +981,10 @@ static void process_wm_config(cJSON *root)
     ESP_LOGI(TAG, "Auto-starting WM receive task");
     wm_uart_start();
 
+    // Persist to the WM module's own NVS so the config survives reboot
+    // (wm_uart loads from this NVS on boot).
+    wm_uart_save_config();
+
     ESP_LOGI(TAG, "WM config applied: model=%d, baud=%d, stream=%d",
              model->valueint, baud->valueint, stream->valueint);
 
@@ -998,6 +1061,9 @@ static void process_ma_config(cJSON *root)
     // Note: MA is always running (like Pico2W PIO behavior)
     // stream setting only controls output filtering, not receiving
 
+    // Persist to the MA module's own NVS so the config survives reboot.
+    ma_uart_save_config();
+
     ESP_LOGI(TAG, "MA config applied: model=%d, baud=%d, stream=%d",
              model->valueint, baud->valueint, stream->valueint);
 
@@ -1070,6 +1136,8 @@ static void process_printer_config(cJSON *root)
     // Apply to Printer UART at runtime
     printer_uart_set_baud(baud->valueint);
     printer_uart_set_parity(parity->valueint);
+    // Persist to the printer module's own NVS so the config survives reboot.
+    printer_uart_save_config();
 #endif
 
     ESP_LOGI(TAG, "Printer config applied: model=%d, baud=%d, parity=%d",
@@ -1126,7 +1194,24 @@ static void process_reset_config(void)
 
     // TODO: Apply Printer defaults when ready
 
-    send_response(RESP_RESET_CONFIG_SUCCESS, STATUS_OK, NULL);
+    // Report the WM/MA/printer defaults (model/baud/parity/etc.) so the user
+    // sees exactly what was reset and knows what to reconfigure. device_name is
+    // intentionally omitted (unused field); WiFi credentials are NOT affected.
+    static char cfg_json[RESPONSE_BUF_SIZE];
+    snprintf(cfg_json, sizeof(cfg_json),
+        "{\"ma\":{\"model\":%d,\"baud_rate\":%lu,\"data_bits\":%d,\"stop_bits\":%d,\"parity\":%d,\"stream\":%d},"
+        "\"wm\":{\"model\":%d,\"baud_rate\":%lu,\"data_bits\":%d,\"stop_bits\":%d,\"parity\":%d,\"stream\":%d},"
+        "\"printer\":{\"model\":%d,\"baud_rate\":%lu,\"data_bits\":%d,\"stop_bits\":%d,\"parity\":%d}}",
+        g_device_config.ma_config.model, (unsigned long)g_device_config.ma_config.baud_rate,
+        g_device_config.ma_config.data_bits, g_device_config.ma_config.stop_bits,
+        g_device_config.ma_config.parity, g_device_config.ma_config.stream_mode ? 1 : 0,
+        g_device_config.wm_config.model, (unsigned long)g_device_config.wm_config.baud_rate,
+        g_device_config.wm_config.data_bits, g_device_config.wm_config.stop_bits,
+        g_device_config.wm_config.parity, g_device_config.wm_config.stream_mode ? 1 : 0,
+        g_device_config.printer_config.model, (unsigned long)g_device_config.printer_config.baud_rate,
+        g_device_config.printer_config.data_bits, g_device_config.printer_config.stop_bits,
+        g_device_config.printer_config.parity);
+    send_response(RESP_RESET_CONFIG_SUCCESS, STATUS_OK, cfg_json);
 }
 
 /**
@@ -1329,5 +1414,87 @@ static void process_self_diagnosis(void)
     // Output to BLE
     if (s_output_callback) {
         s_output_callback(diag_buf, strlen(diag_buf));
+    }
+}
+
+/**
+ * @brief Process "diag" command - on-demand connectivity + config snapshot.
+ *
+ * Read-only. Gathers the active network link's own status, MQTT broker state +
+ * publish/drop counters, and the current WM/MA/printer serial config (incl.
+ * parity), then sends ONE JSON snapshot to BLE + USB console. Touches no data
+ * path, so it works even if MQTT is down (it just reports mqtt.connected=false).
+ *
+ * Reply (WiFi product):
+ * {"device":"diag","device_id":"d0cf1319a352","link":"wifi",
+ *  "wifi":{"connected":true,"ssid":"GormalOne","ip":"192.168.1.244","rssi":-61},
+ *  "mqtt":{"connected":true,"broker":"wss://...","published":5,"dropped":0,...},
+ *  "config":{"ma":{...},"wm":{...},"printer":{...},"device_name":""}}
+ *
+ * "link" names the connectivity object, so the GSM product returns the same
+ * shape with "link":"gsm" and a "gsm":{...} object instead - no change here.
+ * With no link up it reads "link":"none" and the object is {}.
+ */
+static void process_diag(void)
+{
+    // Current WM/MA/printer config (incl. parity) as a JSON object.
+    static char cfg_json[RESPONSE_BUF_SIZE];
+    config_get_json(cfg_json, sizeof(cfg_json));
+
+    // Connectivity status, asked FROM the active link rather than read out of a
+    // transport we assume is there. On this product that is wifi_sta reporting
+    // ssid/ip/rssi; on the GSM product it will be the gsm component reporting
+    // SIM and signal - and this function does not change. "none" when no link is
+    // up, "unconfigured" when the build has no connectivity layer at all.
+    const char *link_name = net_link_active();
+    static char link_json[160];
+    net_link_status_json(link_json, sizeof(link_json));
+
+    // MQTT status + publish/drop counters
+    static char mqtt_json[320];
+#ifdef CONFIG_NCLE_MQTT_ENABLE
+    mqtt_svc_stats_t mst;
+    mqtt_svc_get_stats(&mst);
+    sf_info_t sfi;
+    sf_get_info(&sfi);
+    snprintf(mqtt_json, sizeof(mqtt_json),
+             "{\"connected\":%s,\"broker\":\"%s\",\"published\":%lu,\"dropped\":%lu,"
+             "\"deduped\":%lu,\"buffered\":%lu,\"buffer_used_pct\":%u,\"evicted\":%lu}",
+             mst.connected ? "true" : "false", mqtt_svc_broker_uri(),
+             (unsigned long)mst.published, (unsigned long)mst.dropped,
+             (unsigned long)mst.deduped, (unsigned long)mst.buffered,
+             (unsigned)sfi.used_pct, (unsigned long)sfi.evicted);
+#else
+    snprintf(mqtt_json, sizeof(mqtt_json), "{\"enabled\":false}");
+#endif
+
+    // Assemble the full snapshot (static to avoid stack overflow).
+    // The connectivity object is keyed by the link's own NAME - "wifi" here,
+    // "gsm" on the GSM product - and "link" says which name to look for. On this
+    // WiFi product the reply is therefore unchanged apart from the added "link"
+    // field, so existing readers of diag.wifi keep working.
+    // "ble_data" is the configured mode, not the momentary state: with "auto"
+    // the app stops receiving readings as soon as the broker connects. Without
+    // it, "the app shows nothing" is indistinguishable from a fault.
+    // "always" with the buffer off is the "app" mode - report it as it was set.
+    uint8_t bd_mode = config_get_ble_data_mode();
+    bool    sf_on   = config_get_store_forward();
+    const char *bd_name = (bd_mode == BLE_DATA_ALWAYS && !sf_on)
+                              ? "app" : config_ble_data_mode_name(bd_mode);
+    static char diag_buf[RESPONSE_BUF_SIZE + 512];
+    int len = snprintf(diag_buf, sizeof(diag_buf),
+             "{\"device\":\"diag\",\"device_id\":\"%012llx\",\"link\":\"%s\","
+             "\"%s\":%s,\"mqtt\":%s,\"ble_data\":\"%s\","
+             "\"store_forward\":%s,\"config\":%s}\n",
+             (unsigned long long)get_unique_id(), link_name,
+             link_name, link_json, mqtt_json, bd_name,
+             sf_on ? "true" : "false", cfg_json);
+
+    // Output to USB console
+    printf("%s", diag_buf);
+
+    // Output to BLE (if callback registered)
+    if (s_output_callback) {
+        s_output_callback(diag_buf, len);
     }
 }

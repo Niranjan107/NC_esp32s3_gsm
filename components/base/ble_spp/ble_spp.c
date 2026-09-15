@@ -374,7 +374,7 @@ static void process_ble_rx_data(const uint8_t *data, uint16_t len)
                 // Only process if it looks like JSON (starts with '{')
                 if (s_cmd_buffer[0] == '{') {
                     ESP_LOGI(TAG, "BLE RX Command: %s", s_cmd_buffer);
-                    parse_and_process_commands(s_cmd_buffer, s_cmd_index);
+                    parse_and_process_commands(s_cmd_buffer, s_cmd_index, CMD_SRC_BLE);
                 }
             }
             // Reset buffer

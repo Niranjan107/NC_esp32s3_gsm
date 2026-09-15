@@ -82,6 +82,7 @@
  */
 
 #include "printer_uart.h"
+#include "common.h"   // For cycle timing instrumentation
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -1268,6 +1269,63 @@ bool printer_print_raw(const char *text)
  * ============================================================================
  * Mobile App → BLE → cmd_parser → THIS FUNCTION → UART → Printer
  */
+/**
+ * @brief Print one line of plain text plus a newline (no escape processing)
+ */
+static void print_plain_line(const char *text)
+{
+    // Send character by character, the identical path the receipt body uses.
+    // The body prints cleanly going one byte at a time with a small gap;
+    // a bulk write with no gaps comes out as junk on this printer.
+    for (const char *p = text; *p; p++) {
+        printer_print_char(*p);
+    }
+    printer_new_line();
+}
+
+/**
+ * @brief Print the cycle timing on the receipt - ONCE per power cycle
+ *
+ * Single compact line: T0*T1*T2*T3*T4*T5, all in ms from T0.
+ *   e.g. 0*4795*4798*8217*8217*9511
+ *
+ * Printed on the first receipt after the connector starts and not again, so
+ * each power cycle yields one sample without costing paper on every receipt.
+ * Re-arm without rebooting via {"command":"set_timing_debug","enable":1}#
+ */
+static void print_timing_block(void)
+{
+    char line[64];
+
+    // The receipt's own "|c" emits GS V without its mode byte, so the printer
+    // is left waiting for one more byte and swallows whatever arrives next.
+    // Feed it this newline to consume, otherwise it eats the first digit of
+    // the timing line below (the leading "0" goes missing).
+    //
+    // Nothing in the app's receipt data is altered - this byte belongs to our
+    // timing block, which is printed after the receipt is already complete.
+    printer_new_line();
+
+    snprintf(line, sizeof(line), "%ld*%ld*%ld*%ld*%ld*%ld",
+             (long)timing_get_ms(TIMING_T0_MA_FIRST),
+             (long)timing_get_ms(TIMING_T1_MA_DONE),
+             (long)timing_get_ms(TIMING_T2_APP_SENT),
+             (long)timing_get_ms(TIMING_T3_CMD_RX),
+             (long)timing_get_ms(TIMING_T4_PRINT_FIRST),
+             (long)timing_get_ms(TIMING_T5_PRINT_DONE));
+    print_plain_line(line);
+
+    // Feed clear of the print head so the line can be torn off. The receipt's
+    // own "|c" already ran (it sits at the end of the final chunk's text), so
+    // without these the line would be left inside the mechanism.
+    for (int i = 0; i < 4; i++) {
+        printer_new_line();
+    }
+
+    // One sample per power cycle - disarm until the connector restarts.
+    timing_set_receipt_print(false);
+}
+
 bool printer_print_with_special_chars(const char *text)
 {
     // Validate input
@@ -1291,6 +1349,10 @@ bool printer_print_with_special_chars(const char *text)
         if (s_callback) s_callback(false);
         return false;
     }
+
+    // T4 - printing starts. mark_once because the app sends one receipt as
+    // several print_receipt commands and T4 must record the FIRST of them.
+    timing_mark_once(TIMING_T4_PRINT_FIRST);
 
     // Process text character by character
     const char *p = text;
@@ -1436,6 +1498,21 @@ bool printer_print_with_special_chars(const char *text)
         }
 
         p++;  // Move to next character
+    }
+
+    // T5 - this chunk is done. Each chunk overwrites it, so the last one wins.
+    timing_mark(TIMING_T5_PRINT_DONE);
+
+    char tbuf[96];
+    timing_format(tbuf, sizeof(tbuf));
+    ESP_LOGI(TAG, "Cycle timing (ms): %s", tbuf);
+
+    // Timing block on paper - ONLY on the final chunk of the receipt.
+    // The app sends one receipt as several print_receipt commands, so without
+    // this gate every chunk would print its own block. "|c" (cut paper) is
+    // only present in the last one.
+    if (timing_get_receipt_print() && strstr(text, "|c") != NULL) {
+        print_timing_block();
     }
 
     ESP_LOGI(TAG, "Receipt printed successfully");
