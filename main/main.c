@@ -278,15 +278,23 @@ static void wm_ble_data_callback(const char *json_data, size_t len)
 static void gsm_ble_status_callback(const gsm_status_t *s, void *ctx)
 {
     (void)ctx;
-    static char buf[256];
+    static char buf[512];
     /* Reports each connectivity stage separately (alive / sim / registered /
      * data) so the app can show WHICH one failed, rather than one ambiguous
-     * "connected". "data" true means an IP is actually assigned. */
+     * "connected". "data" true means an IP is actually assigned.
+     *
+     * "problem" and "action" carry plain-language text the app can display
+     * directly - the user cannot act on rssi=4 or net=3, but can act on
+     * "Check the antenna" or "Call the carrier". */
     int n = snprintf(buf, sizeof(buf),
         "{\"device\":\"gsm\",\"alive\":%d,\"sim\":\"%s\",\"registered\":%d,"
-        "\"data\":%d,\"rssi\":%d,\"bars\":%d,\"net\":%d,\"iccid\":\"%s\"}\n",
+        "\"data\":%d,\"rssi\":%d,\"bars\":%d,\"net\":%d,\"iccid\":\"%s\","
+        "\"fault\":\"%s\",\"problem\":\"%s\",\"action\":\"%s\"}\n",
         s->alive, gsm_sim_status_str(s->sim_status), s->registered,
-        s->data_up, s->rssi, s->bars, (int)s->net_status, s->iccid);
+        s->data_up, s->rssi, s->bars, (int)s->net_status, s->iccid,
+        gsm_fault_name(s->fault),
+        gsm_fault_problem(s->fault),
+        gsm_fault_action(s->fault));
     if (n > 0 && n < (int)sizeof(buf)) {
         ble_spp_output_callback(buf, (unsigned int)n);
     }
@@ -897,6 +905,26 @@ void app_main(void)
 #ifdef CONFIG_NCLE_GSM_ENABLE
         gsm_task_set_status_callback(gsm_ble_status_callback, NULL);
         ESP_LOGI(TAG, "GSM -> BLE callback registered");
+
+#ifdef CONFIG_NCLE_GSM_AUTO_START
+        /* Field devices have nobody to send gsm_enable. The task retries with
+         * back-off if the modem is absent or slow to power up, and all of its
+         * work happens on its own task - WM, MA, printer and BLE keep running
+         * normally throughout, including during the ~2 min worst case when
+         * every APN fails.
+         *
+         * A user who sent gsm_disable stays disabled: auto-start must not
+         * silently undo a deliberate choice at the next power cycle. */
+        if (!gsm_is_enabled_pref()) {
+            ESP_LOGI(TAG, "GSM Module: disabled by user - send 'gsm_enable' to turn on");
+        } else if (gsm_task_start() == ESP_OK) {
+            ESP_LOGI(TAG, "GSM Module: auto-start enabled, connecting...");
+        } else {
+            ESP_LOGW(TAG, "GSM Module: auto-start failed to launch task");
+        }
+#else
+        ESP_LOGI(TAG, "GSM Module: waiting for 'gsm_enable' command");
+#endif
         // gsm_task_start() is NOT called here; waits for BLE command {"command":"gsm_enable"}
 #endif
     } else {

@@ -33,6 +33,11 @@ typedef struct {
     uint8_t               bars;           /* 0-5, derived from rssi */
     char                  module_info[64];
     char                  iccid[24];      /* SIM serial, "" if unread */
+
+    /* First failing stage, with plain-language text available via
+     * gsm_fault_problem()/gsm_fault_action(). Lets the mobile app show the
+     * user what to DO, instead of numbers they cannot interpret. */
+    gsm_fault_t           fault;
 } gsm_status_t;
 
 typedef void (*gsm_status_cb_t)(const gsm_status_t *s, void *ctx);

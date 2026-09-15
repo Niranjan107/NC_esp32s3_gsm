@@ -61,6 +61,11 @@ typedef enum {
 gsm_sim_status_t gsm_get_sim_status(void);
 const char      *gsm_sim_status_str(gsm_sim_status_t s);
 
+/* Drop the short-lived SIM status cache, forcing the next query to ask the
+ * modem. Call after a reset or power cycle, where the cached answer describes
+ * the state before it. */
+void             gsm_sim_cache_invalidate(void);
+
 /* ===== Data link (PPP via esp_modem) =====
  *
  * These replace the AT-command data path. Once gsm_ppp_start() has run and
@@ -84,6 +89,64 @@ const char      *gsm_sim_status_str(gsm_sim_status_t s);
  *         ESP_ERR_INVALID_STATE  SIM absent or PIN-locked
  */
 esp_err_t gsm_ppp_start(void);
+
+/* ===== Fault diagnosis =====
+ *
+ * Connectivity fails in six distinct ways, each needing a DIFFERENT fix. The
+ * numeric status fields (rssi=4, net=3, data=0) are accurate but useless to
+ * whoever is standing in front of the machine - and two of these are actively
+ * misleading if not separated:
+ *
+ *   WEAK SIGNAL   the device half-works and drops randomly, which is harder to
+ *                 diagnose than a clean failure because nothing looks broken
+ *                 until data goes missing.
+ *   SIM BARRED    the network REFUSES the SIM (unpaid bill, blocked IMEI).
+ *                 Reported as "not registered" it looks like an antenna fault,
+ *                 so someone checks the antenna when the real fix is a phone
+ *                 call to the carrier.
+ *
+ * Checks run in order and stop at the first failure: reporting "no internet"
+ * when the SIM is not inserted would send someone to fix the wrong thing.
+ */
+typedef enum {
+    GSM_FAULT_NONE = 0,         /* everything works                      */
+    GSM_FAULT_MODEM_DEAD,       /* no reply to AT - power/wiring         */
+    GSM_FAULT_SIM_ABSENT,       /* no card in the holder                 */
+    GSM_FAULT_SIM_LOCKED,       /* PIN/PUK required                      */
+    GSM_FAULT_SIM_FAILURE,      /* card present but faulty               */
+    GSM_FAULT_NO_SIGNAL,        /* CSQ 99 - antenna disconnected         */
+    GSM_FAULT_WEAK_SIGNAL,      /* CSQ < 10 - antenna loose/bad location */
+    GSM_FAULT_SIM_BARRED,       /* CREG 3 - network refused this SIM     */
+    GSM_FAULT_NO_COVERAGE,      /* CREG 2 too long - no network here     */
+    GSM_FAULT_NO_DATA_LINK,     /* registered but no IP - APN wrong      */
+    GSM_FAULT_NO_INTERNET,      /* IP assigned but nothing routes        */
+} gsm_fault_t;
+
+/* Short machine-readable name, e.g. "sim_barred". Never NULL. */
+const char *gsm_fault_name(gsm_fault_t f);
+
+/* One sentence describing what is wrong, in plain language. Never NULL. */
+const char *gsm_fault_problem(gsm_fault_t f);
+
+/* One sentence telling the user what to DO about it. Never NULL. */
+const char *gsm_fault_action(gsm_fault_t f);
+
+/**
+ * @brief Run the six checks in order and report the first failure.
+ *
+ * Prints a numbered stage-by-stage summary to the log, so whoever reads it -
+ * engineer or field technician - sees exactly which stage failed and what to
+ * do, without having to interpret AT traffic.
+ *
+ * @param check_internet  also verify traffic actually flows (costs a ping).
+ *                        Pass false for a quick check that stops at "got IP".
+ * @return GSM_FAULT_NONE when every stage passed.
+ */
+gsm_fault_t gsm_diagnose(bool check_internet);
+
+/* Signal strength below this (AT+CSQ scale, 0-31) is reported as WEAK: the
+ * link comes and goes rather than failing cleanly. */
+#define GSM_RSSI_WEAK_THRESHOLD   10
 
 /* ===== Connectivity self-test =====
  *
@@ -113,6 +176,16 @@ esp_err_t gsm_apn_store(const char *apn);
 
 /* Read the stored APN. Returns ESP_ERR_NOT_FOUND when none is set. */
 esp_err_t gsm_apn_get(char *out, size_t out_size);
+
+/* ===== Enable/disable preference (persisted) =====
+ *
+ * gsm_disable must survive a reboot: with auto-start enabled, a choice held
+ * only in RAM would be silently undone at the next power cycle - the device
+ * back online after the user deliberately turned it off.
+ * Defaults to enabled on a device that has never been configured.
+ */
+bool      gsm_is_enabled_pref(void);
+esp_err_t gsm_set_enabled_pref(bool enabled);
 
 /* Return to pure command mode, dropping the data link. */
 esp_err_t gsm_ppp_stop(void);

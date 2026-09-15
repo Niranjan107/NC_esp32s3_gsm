@@ -65,6 +65,10 @@ static esp_netif_t      *s_ppp_netif = NULL;
  * gsm_pdp_is_active() reports this. */
 static volatile bool s_ppp_got_ip = false;
 
+/* Cached module identity ("Quectel EC200U"), filled by gsm_get_module_info()
+ * so the diagnostic can name the hardware without another AT round trip. */
+static char s_module_info[48] = {0};
+
 /* ============================================================================
  * APN selection
  * ============================================================================
@@ -153,11 +157,78 @@ esp_err_t gsm_apn_get(char *out, size_t out_size)
     return gsm_apn_load(out, out_size) ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
+/* ===== Enable/disable preference =====
+ *
+ * Persisted so that a user who sends gsm_disable stays disabled across a power
+ * cycle. Without this, auto-start would silently undo their choice at the next
+ * reboot - the device would be back online after they deliberately turned it
+ * off, with no indication why.
+ */
+#define GSM_NVS_KEY_ENABLED  "enabled"
+
+bool gsm_is_enabled_pref(void)
+{
+    nvs_handle_t nvs;
+    uint8_t enabled = 1;      /* default ON: a fresh device should connect */
+
+    if (nvs_open(GSM_NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
+        if (nvs_get_u8(nvs, GSM_NVS_KEY_ENABLED, &enabled) != ESP_OK) {
+            enabled = 1;      /* key absent - never configured, so default ON */
+        }
+        nvs_close(nvs);
+    }
+    return (enabled != 0);
+}
+
+esp_err_t gsm_set_enabled_pref(bool enabled)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(GSM_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+
+    err = nvs_set_u8(nvs, GSM_NVS_KEY_ENABLED, enabled ? 1 : 0);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+
+    ESP_LOGI(TAG, "GSM %s (saved - survives reboot)",
+             enabled ? "ENABLED" : "DISABLED");
+    return err;
+}
+
 /* PPP/IP event handler: the single source of truth for "is the data link up".
  * Registered in gsm_init(), so the flag is correct even if PPP drops on its own. */
 static void gsm_ip_event_handler(void *arg, esp_event_base_t base,
                                  int32_t event_id, void *event_data)
 {
+    /* Two event bases arrive here and their id values overlap numerically, so
+     * they must be separated by base before switching. */
+    if (base == NETIF_PPP_STATUS) {
+        switch (event_id) {
+            /* The LCP keepalive failing is how a modem that vanished
+             * mid-session is detected. Nothing else can see it: the UART is
+             * carrying PPP frames so AT commands are unavailable, and without
+             * this the link sat reporting data=1 indefinitely with the modem
+             * powered off. */
+            case NETIF_PPP_ERRORPEERDEAD:
+                ESP_LOGE(TAG, "PPP peer dead (no keepalive reply) - modem gone");
+                s_ppp_got_ip = false;
+                break;
+            case NETIF_PPP_ERRORCONNECT:
+                ESP_LOGW(TAG, "PPP connection lost");
+                s_ppp_got_ip = false;
+                break;
+            case NETIF_PPP_PHASE_DEAD:
+                if (s_ppp_got_ip) {
+                    ESP_LOGW(TAG, "PPP phase DEAD - data link down");
+                    s_ppp_got_ip = false;
+                }
+                break;
+            default:
+                break;
+        }
+        return;
+    }
+
     switch (event_id) {
         case IP_EVENT_PPP_GOT_IP: {
             ip_event_got_ip_t *e = (ip_event_got_ip_t *)event_data;
@@ -324,10 +395,37 @@ static esp_err_t gsm_modem_init(void)
  *         GSM_SIM_PIN_REQUIRED card present but locked
  *         GSM_SIM_ERROR        modem did not answer
  */
+/* Short-lived cache of the SIM answer.
+ *
+ * Several callers ask independently - the startup sequence, each poll, the
+ * gsm_ppp_start() precondition, and gsm_diagnose(). With a 5-attempt retry loop
+ * inside, an absent SIM turned one question into five separate 5-second probes
+ * per cycle: about 25 seconds of AT traffic all establishing the same fact.
+ *
+ * A few seconds of caching collapses that to one real check. The window is
+ * short enough that inserting a SIM is still noticed within one poll. */
+#define GSM_SIM_CACHE_VALID_MS   5000
+
+static gsm_sim_status_t s_sim_cached      = GSM_SIM_ERROR;
+static int64_t          s_sim_cached_at   = 0;
+
+/* Force the next gsm_get_sim_status() to talk to the modem. Called after a
+ * reset or power cycle, where the cached answer describes the old state. */
+void gsm_sim_cache_invalidate(void)
+{
+    s_sim_cached_at = 0;
+}
+
 gsm_sim_status_t gsm_get_sim_status(void)
 {
     char resp[128] = {0};
     bool saw_absent = false;
+
+    int64_t now = esp_timer_get_time();
+    if (s_sim_cached_at != 0 &&
+        (now - s_sim_cached_at) < (GSM_SIM_CACHE_VALID_MS * 1000)) {
+        return s_sim_cached;
+    }
 
     /* The SIM interface is not ready the instant the modem boots or resets: the
      * module answers "+CME ERROR: 14" (SIM busy) for a second or two while it
@@ -338,12 +436,17 @@ gsm_sim_status_t gsm_get_sim_status(void)
         esp_err_t err = gsm_send_at_command("+CPIN?", resp, sizeof(resp), 5000);
 
         if (err == ESP_OK) {
-            if (strstr(resp, "READY")) return GSM_SIM_READY;
-            if (strstr(resp, "SIM PIN") || strstr(resp, "SIM PUK")) {
-                return GSM_SIM_PIN_REQUIRED;
+            gsm_sim_status_t r = GSM_SIM_ERROR;
+            if (strstr(resp, "READY")) {
+                r = GSM_SIM_READY;
+            } else if (strstr(resp, "SIM PIN") || strstr(resp, "SIM PUK")) {
+                r = GSM_SIM_PIN_REQUIRED;
+            } else {
+                ESP_LOGW(TAG, "Unrecognised +CPIN? reply: %s", resp);
             }
-            ESP_LOGW(TAG, "Unrecognised +CPIN? reply: %s", resp);
-            return GSM_SIM_ERROR;
+            s_sim_cached    = r;
+            s_sim_cached_at = esp_timer_get_time();
+            return r;
         }
 
         /* Non-OK: the reply text distinguishes the real cases.
@@ -352,8 +455,16 @@ gsm_sim_status_t gsm_get_sim_status(void)
          *   CME 10 = SIM not inserted   -> NOT definitive, see below
          *   CME 14 = SIM busy           -> transient by definition
          */
-        if (strstr(resp, "+CME ERROR: 12")) return GSM_SIM_PIN_REQUIRED;
-        if (strstr(resp, "+CME ERROR: 13")) return GSM_SIM_ERROR;
+        if (strstr(resp, "+CME ERROR: 12")) {
+            s_sim_cached = GSM_SIM_PIN_REQUIRED;
+            s_sim_cached_at = esp_timer_get_time();
+            return GSM_SIM_PIN_REQUIRED;
+        }
+        if (strstr(resp, "+CME ERROR: 13")) {
+            s_sim_cached = GSM_SIM_ERROR;
+            s_sim_cached_at = esp_timer_get_time();
+            return GSM_SIM_ERROR;
+        }
 
         /* CME 10 is reported as "SIM not inserted", but a freshly booted module
          * answers 10 for a moment before its SIM interface comes up - observed
@@ -383,10 +494,14 @@ gsm_sim_status_t gsm_get_sim_status(void)
     /* Persistently "not inserted" across every attempt: now believe it. */
     if (saw_absent) {
         ESP_LOGW(TAG, "SIM absent (consistent across retries)");
+        s_sim_cached    = GSM_SIM_ABSENT;
+        s_sim_cached_at = esp_timer_get_time();
         return GSM_SIM_ABSENT;
     }
 
     ESP_LOGW(TAG, "SIM status unresolved after retries: %s", resp);
+    s_sim_cached    = GSM_SIM_ERROR;
+    s_sim_cached_at = esp_timer_get_time();
     return GSM_SIM_ERROR;
 }
 
@@ -409,6 +524,8 @@ static void gsm_modem_deinit(void)
     esp_event_handler_unregister(IP_EVENT, IP_EVENT_PPP_GOT_IP,
                                  &gsm_ip_event_handler);
     esp_event_handler_unregister(IP_EVENT, IP_EVENT_PPP_LOST_IP,
+                                 &gsm_ip_event_handler);
+    esp_event_handler_unregister(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID,
                                  &gsm_ip_event_handler);
 
     if (s_dce) {
@@ -626,6 +743,234 @@ esp_err_t gsm_ppp_start(void)
     ESP_LOGE(TAG, "  - not registered on the network (check gsm_get_network_status)");
     ESP_LOGE(TAG, "========================================");
     return ESP_ERR_NOT_FOUND;
+}
+
+/* ============================================================================
+ * Fault diagnosis
+ * ============================================================================
+ * Six stages, checked in order, stopping at the first failure. Each fault
+ * carries both what is wrong and what to DO, so the log is readable by whoever
+ * is standing in front of the machine - not just by someone who knows that
+ * "net=3" means the carrier barred the SIM.
+ * ===========================================================================*/
+
+const char *gsm_fault_name(gsm_fault_t f)
+{
+    switch (f) {
+        case GSM_FAULT_NONE:         return "ok";
+        case GSM_FAULT_MODEM_DEAD:   return "modem_dead";
+        case GSM_FAULT_SIM_ABSENT:   return "sim_absent";
+        case GSM_FAULT_SIM_LOCKED:   return "sim_locked";
+        case GSM_FAULT_SIM_FAILURE:  return "sim_failure";
+        case GSM_FAULT_NO_SIGNAL:    return "no_signal";
+        case GSM_FAULT_WEAK_SIGNAL:  return "weak_signal";
+        case GSM_FAULT_SIM_BARRED:   return "sim_barred";
+        case GSM_FAULT_NO_COVERAGE:  return "no_coverage";
+        case GSM_FAULT_NO_DATA_LINK: return "no_data_link";
+        case GSM_FAULT_NO_INTERNET:  return "no_internet";
+        default:                     return "unknown";
+    }
+}
+
+const char *gsm_fault_problem(gsm_fault_t f)
+{
+    switch (f) {
+        case GSM_FAULT_NONE:
+            return "Everything working";
+        case GSM_FAULT_MODEM_DEAD:
+            return "GSM module is not responding";
+        case GSM_FAULT_SIM_ABSENT:
+            return "No SIM card detected";
+        case GSM_FAULT_SIM_LOCKED:
+            return "SIM card is PIN locked";
+        case GSM_FAULT_SIM_FAILURE:
+            return "SIM card is present but faulty";
+        case GSM_FAULT_NO_SIGNAL:
+            return "No mobile signal at all";
+        case GSM_FAULT_WEAK_SIGNAL:
+            return "Mobile signal is too weak - connection will drop randomly";
+        case GSM_FAULT_SIM_BARRED:
+            return "Network REFUSED this SIM card";
+        case GSM_FAULT_NO_COVERAGE:
+            return "No mobile network found in this area";
+        case GSM_FAULT_NO_DATA_LINK:
+            return "Registered on network but could not get an IP address";
+        case GSM_FAULT_NO_INTERNET:
+            return "Got an IP address but no data is flowing";
+        default:
+            return "Unknown fault";
+    }
+}
+
+const char *gsm_fault_action(gsm_fault_t f)
+{
+    switch (f) {
+        case GSM_FAULT_NONE:
+            return "No action needed";
+        case GSM_FAULT_MODEM_DEAD:
+            return "Check module power (3.8-4.2V) and the TX/RX wiring";
+        case GSM_FAULT_SIM_ABSENT:
+            return "Insert a SIM card into the holder";
+        case GSM_FAULT_SIM_LOCKED:
+            return "Put the SIM in a phone and switch the PIN lock OFF";
+        case GSM_FAULT_SIM_FAILURE:
+            return "Clean the SIM contacts, reseat it, or try another SIM";
+        case GSM_FAULT_NO_SIGNAL:
+            return "Antenna is disconnected - reconnect it";
+        case GSM_FAULT_WEAK_SIGNAL:
+            return "Check the antenna is screwed on firmly, or move the device "
+                   "near a window / outside";
+        case GSM_FAULT_SIM_BARRED:
+            return "Call the carrier - the SIM may be barred or the bill unpaid";
+        case GSM_FAULT_NO_COVERAGE:
+            return "Move to an area with network coverage, or check the antenna";
+        case GSM_FAULT_NO_DATA_LINK:
+            return "Set the correct APN from the mobile app (apn_config)";
+        case GSM_FAULT_NO_INTERNET:
+            return "Recharge the data pack - the SIM has no active data";
+        default:
+            return "Contact support";
+    }
+}
+
+/* Print the outcome so it reads the same in the console and in a saved log. */
+static void gsm_report_fault(gsm_fault_t f)
+{
+    if (f == GSM_FAULT_NONE) {
+        ESP_LOGI(TAG, ">>> ALL OK - GSM connected and internet working <<<");
+        return;
+    }
+    ESP_LOGE(TAG, ">>> PROBLEM: %s", gsm_fault_problem(f));
+    ESP_LOGE(TAG, ">>> ACTION : %s", gsm_fault_action(f));
+}
+
+gsm_fault_t gsm_diagnose(bool check_internet)
+{
+    ESP_LOGI(TAG, "======== GSM DIAGNOSTIC ========");
+
+    /* While PPP is up the modem is in DATA mode: the UART carries PPP frames,
+     * so an AT command gets no reply. Probing anyway would report "modem not
+     * responding" on a device whose internet is demonstrably working - and
+     * worse, the AT bytes would be injected into the data stream.
+     *
+     * A live data link is itself proof of stages 1-5: the modem answered, the
+     * SIM is valid, the network registered, and an IP was assigned. So report
+     * those from what we already know and go straight to the traffic test. */
+    if (gsm_pdp_is_active()) {
+        ESP_LOGI(TAG, "[1/6] MODEM ......... OK (%s, in data mode)",
+                 s_module_info[0] ? s_module_info : "responding");
+        ESP_LOGI(TAG, "[2/6] SIM ........... OK (data link proves it)");
+        ESP_LOGI(TAG, "[3/6] SIGNAL ........ OK (data link proves it)");
+        ESP_LOGI(TAG, "[4/6] NETWORK ....... OK (registered)");
+        ESP_LOGI(TAG, "[5/6] DATA .......... OK (IP assigned)");
+
+        if (!check_internet) {
+            ESP_LOGI(TAG, "[6/6] INTERNET ...... skipped");
+            ESP_LOGI(TAG, "================================");
+            return GSM_FAULT_NONE;
+        }
+        if (gsm_test_ping("8.8.8.8", 3) != ESP_OK) {
+            ESP_LOGE(TAG, "[6/6] INTERNET ...... NO TRAFFIC");
+            gsm_report_fault(GSM_FAULT_NO_INTERNET);
+            ESP_LOGI(TAG, "================================");
+            return GSM_FAULT_NO_INTERNET;
+        }
+        ESP_LOGI(TAG, "[6/6] INTERNET ...... OK");
+        gsm_report_fault(GSM_FAULT_NONE);
+        ESP_LOGI(TAG, "================================");
+        return GSM_FAULT_NONE;
+    }
+
+    /* --- [1/6] Modem ------------------------------------------------------ */
+    if (s_dce == NULL || !gsm_is_alive()) {
+        ESP_LOGE(TAG, "[1/6] MODEM ......... FAILED");
+        gsm_report_fault(GSM_FAULT_MODEM_DEAD);
+        return GSM_FAULT_MODEM_DEAD;
+    }
+    ESP_LOGI(TAG, "[1/6] MODEM ......... OK (%s)",
+             s_module_info[0] ? s_module_info : "responding");
+
+    /* --- [2/6] SIM -------------------------------------------------------- */
+    gsm_sim_status_t sim = gsm_get_sim_status();
+    if (sim != GSM_SIM_READY) {
+        gsm_fault_t f = (sim == GSM_SIM_ABSENT)       ? GSM_FAULT_SIM_ABSENT
+                      : (sim == GSM_SIM_PIN_REQUIRED) ? GSM_FAULT_SIM_LOCKED
+                                                      : GSM_FAULT_SIM_FAILURE;
+        ESP_LOGE(TAG, "[2/6] SIM ........... FAILED (%s)",
+                 gsm_sim_status_str(sim));
+        gsm_report_fault(f);
+        return f;
+    }
+    {
+        char iccid[24] = {0};
+        if (gsm_get_iccid(iccid, sizeof(iccid)) == ESP_OK) {
+            ESP_LOGI(TAG, "[2/6] SIM ........... OK (%s)", iccid);
+        } else {
+            ESP_LOGI(TAG, "[2/6] SIM ........... OK");
+        }
+    }
+
+    /* --- [3/6] Signal ----------------------------------------------------- */
+    uint8_t rssi = 99, ber = 99;
+    if (gsm_get_signal_strength(&rssi, &ber) != ESP_OK || rssi == 99) {
+        ESP_LOGE(TAG, "[3/6] SIGNAL ........ NONE (csq 99)");
+        gsm_report_fault(GSM_FAULT_NO_SIGNAL);
+        return GSM_FAULT_NO_SIGNAL;
+    }
+    if (rssi < GSM_RSSI_WEAK_THRESHOLD) {
+        /* Not a hard failure - it may still connect - but it is the fault that
+         * causes intermittent drops nobody can explain, so name it plainly. */
+        ESP_LOGW(TAG, "[3/6] SIGNAL ........ WEAK (csq %d of 31)", rssi);
+        gsm_report_fault(GSM_FAULT_WEAK_SIGNAL);
+        return GSM_FAULT_WEAK_SIGNAL;
+    }
+    ESP_LOGI(TAG, "[3/6] SIGNAL ........ OK (csq %d of 31, %d bars)",
+             rssi, (rssi >= 25) ? 5 : (rssi >= 19) ? 4 : (rssi >= 13) ? 3 : 2);
+
+    /* --- [4/6] Network registration --------------------------------------- */
+    gsm_network_status_t net = GSM_NET_UNKNOWN;
+    gsm_get_network_status(&net);
+
+    if (net == GSM_NET_DENIED) {
+        /* The distinction that matters: the network SAW this SIM and refused
+         * it. Reported as "not registered" this looks like an antenna fault. */
+        ESP_LOGE(TAG, "[4/6] NETWORK ....... DENIED (creg 3)");
+        gsm_report_fault(GSM_FAULT_SIM_BARRED);
+        return GSM_FAULT_SIM_BARRED;
+    }
+    if (net != GSM_NET_REGISTERED_HOME && net != GSM_NET_REGISTERED_ROAMING) {
+        ESP_LOGE(TAG, "[4/6] NETWORK ....... NOT REGISTERED (creg %d)", (int)net);
+        gsm_report_fault(GSM_FAULT_NO_COVERAGE);
+        return GSM_FAULT_NO_COVERAGE;
+    }
+    ESP_LOGI(TAG, "[4/6] NETWORK ....... OK (%s)",
+             (net == GSM_NET_REGISTERED_ROAMING) ? "registered, roaming"
+                                                 : "registered, home");
+
+    /* --- [5/6] Data link -------------------------------------------------- */
+    if (!gsm_pdp_is_active()) {
+        ESP_LOGE(TAG, "[5/6] DATA .......... NO IP ADDRESS");
+        gsm_report_fault(GSM_FAULT_NO_DATA_LINK);
+        return GSM_FAULT_NO_DATA_LINK;
+    }
+    ESP_LOGI(TAG, "[5/6] DATA .......... OK (IP assigned)");
+
+    /* --- [6/6] Internet --------------------------------------------------- */
+    if (!check_internet) {
+        ESP_LOGI(TAG, "[6/6] INTERNET ...... skipped");
+        ESP_LOGI(TAG, "================================");
+        return GSM_FAULT_NONE;
+    }
+    if (gsm_test_ping("8.8.8.8", 3) != ESP_OK) {
+        ESP_LOGE(TAG, "[6/6] INTERNET ...... NO TRAFFIC");
+        gsm_report_fault(GSM_FAULT_NO_INTERNET);
+        return GSM_FAULT_NO_INTERNET;
+    }
+    ESP_LOGI(TAG, "[6/6] INTERNET ...... OK");
+
+    gsm_report_fault(GSM_FAULT_NONE);
+    ESP_LOGI(TAG, "================================");
+    return GSM_FAULT_NONE;
 }
 
 /* ============================================================================
@@ -995,6 +1340,10 @@ esp_err_t gsm_init(void)
                                                &gsm_ip_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_LOST_IP,
                                                &gsm_ip_event_handler, NULL));
+    /* NETIF_PPP_STATUS carries the keepalive/phase events - ESP_EVENT_ANY_ID
+     * because the error codes and phase codes share this base. */
+    ESP_ERROR_CHECK(esp_event_handler_register(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID,
+                                               &gsm_ip_event_handler, NULL));
 
     if (gsm_modem_init() != ESP_OK) {
         return ESP_FAIL;
@@ -1095,12 +1444,14 @@ esp_err_t gsm_get_module_info(char *info, size_t info_size)
             if (len < info_size) {
                 memcpy(info, start, len);
                 info[len] = '\0';
+                strncpy(s_module_info, info, sizeof(s_module_info) - 1);
                 return ESP_OK;
             }
         }
     }
     strncpy(info, response, info_size - 1);
     info[info_size - 1] = '\0';
+    strncpy(s_module_info, info, sizeof(s_module_info) - 1);
     return ESP_OK;
 }
 

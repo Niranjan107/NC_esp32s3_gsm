@@ -70,3 +70,13 @@ CONFIG_LWIP_PPP_NOTIFY_PHASE_SUPPORT=y
 CONFIG_LWIP_PPP_PAP_SUPPORT=y
 CONFIG_LWIP_PPP_CHAP_SUPPORT=y
 
+# LCP echo keepalive - REQUIRED, not optional.
+# Without it PPP never notices the peer has gone: with the modem powered off
+# mid-session the link stayed "connected" indefinitely, reporting data=1 while
+# nothing could possibly flow. AT commands cannot be used to check, because the
+# UART is carrying PPP frames - the keepalive is the only signal available.
+# 3s interval x 3 failures = dead link detected in about 9 seconds.
+CONFIG_LWIP_ENABLE_LCP_ECHO=y
+CONFIG_LWIP_LCP_ECHOINTERVAL=3
+CONFIG_LWIP_LCP_MAXECHOFAILS=3
+

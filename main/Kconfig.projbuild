@@ -295,6 +295,24 @@ menu "NCLite CLEV4"
                 Requires hardware UART0 to be free - WM must be on soft UART
                 (CONFIG_NCLE_WM_USE_SOFT_UART=y).
 
+        config NCLE_GSM_AUTO_START
+            bool "Start GSM automatically at boot"
+            default y
+            depends on NCLE_GSM_ENABLE
+            help
+                When enabled, gsm_task starts during boot and brings the data
+                link up without waiting for the BLE/USB "gsm_enable" command.
+                Required for a field device: nobody is present to send
+                commands to a machine at a collection centre.
+
+                The task retries with back-off if the modem is missing or slow
+                to power up, so enabling this is safe even when the modem
+                boots after the ESP32.
+
+                Disable to keep the old behaviour (wait for gsm_enable), which
+                is useful while bench-testing a change and you want to trigger
+                the connection deliberately and watch it.
+
         config NCLE_GSM_UART_NUM
             int "GSM UART Port Number (0, 1, or 2)"
             default 0

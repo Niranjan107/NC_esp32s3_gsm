@@ -656,6 +656,9 @@ void parse_and_process_commands(char *json_str, int json_len)
     else if (strcmp(cmd, CMD_GSM_ENABLE) == 0) {
 #ifdef CONFIG_NCLE_GSM_ENABLE
         esp_err_t err = gsm_task_start();
+        /* Persist, so a device re-enabled by hand also comes back after a
+         * power cycle - the mirror of gsm_disable below. */
+        if (err == ESP_OK) gsm_set_enabled_pref(true);
         send_response(err == ESP_OK ? RESP_GSM_ENABLE_STARTED
                                     : RESP_GSM_ENABLE_FAILED,
                       err == ESP_OK ? STATUS_OK : STATUS_ERR, NULL);
@@ -666,6 +669,9 @@ void parse_and_process_commands(char *json_str, int json_len)
     else if (strcmp(cmd, CMD_GSM_DISABLE) == 0) {
 #ifdef CONFIG_NCLE_GSM_ENABLE
         gsm_task_stop();
+        /* Persist the choice: with auto-start enabled, a preference held only
+         * in RAM would be undone at the next reboot. */
+        gsm_set_enabled_pref(false);
         send_response(RESP_GSM_DISABLE_STOPPED, STATUS_OK, NULL);
 #else
         send_response(RESP_GSM_NOT_ENABLED, STATUS_ERR, NULL);
