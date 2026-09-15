@@ -69,6 +69,23 @@ static volatile bool s_ppp_got_ip = false;
  * so the diagnostic can name the hardware without another AT round trip. */
 static char s_module_info[48] = {0};
 
+/* Signal strength sampled immediately before entering data mode. AT+CSQ cannot
+ * run once PPP owns the UART, so this is the last true reading available for
+ * the duration of the session. */
+static uint8_t s_rssi_at_data_entry = 99;
+static uint8_t s_ber_at_data_entry  = 99;
+
+/* Report the signal captured on the way into data mode. Returns false when no
+ * reading was obtained, so the caller can fall back rather than show a stale
+ * number as if it were current. */
+bool gsm_get_data_mode_signal(uint8_t *rssi, uint8_t *ber)
+{
+    if (s_rssi_at_data_entry == 99) return false;
+    if (rssi) *rssi = s_rssi_at_data_entry;
+    if (ber)  *ber  = s_ber_at_data_entry;
+    return true;
+}
+
 /* ============================================================================
  * APN selection
  * ============================================================================
@@ -441,6 +458,14 @@ gsm_sim_status_t gsm_get_sim_status(void)
                 r = GSM_SIM_READY;
             } else if (strstr(resp, "SIM PIN") || strstr(resp, "SIM PUK")) {
                 r = GSM_SIM_PIN_REQUIRED;
+            } else if (strstr(resp, "POWERED DOWN") || strstr(resp, "RDY")) {
+                /* The module is mid-boot - it answers "POWERED DOWN" while
+                 * coming back from a power cycle. That is not a SIM fault, but
+                 * reporting it as one told the user to clean the contacts of a
+                 * SIM that was fine and READY ten seconds later. Wait instead. */
+                ESP_LOGI(TAG, "modem still booting, waiting (%d/5)...", attempt + 1);
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                continue;
             } else {
                 ESP_LOGW(TAG, "Unrecognised +CPIN? reply: %s", resp);
             }
@@ -614,6 +639,18 @@ static esp_err_t gsm_ppp_try_apn(const char *apn, bool first_attempt)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "set_apn('%s') failed: 0x%x", apn, err);
         return err;
+    }
+
+    /* Capture signal strength NOW, while AT is still available. Once PPP owns
+     * the UART, AT+CSQ cannot run, so whatever is cached at this moment is what
+     * the status will report for the whole session. Without this the value left
+     * over from before a recovery was stale - typically 99 ("unknown"), which
+     * displayed as 0 bars on a connection that was working perfectly. */
+    uint8_t rssi = 99, ber = 99;
+    if (gsm_get_signal_strength(&rssi, &ber) == ESP_OK && rssi != 99) {
+        s_rssi_at_data_entry = rssi;
+        s_ber_at_data_entry  = ber;
+        ESP_LOGI(TAG, "signal at data-mode entry: csq %d", rssi);
     }
 
     /* Plain DATA mode, NOT CMUX.

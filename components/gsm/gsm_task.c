@@ -78,8 +78,13 @@ static void poll_and_report(void)
     if (gsm_pdp_is_active()) {
         s.data_up    = true;
         s.alive      = true;                      /* PPP traffic proves it */
-        s.rssi       = s_last_status.rssi;        /* last reading before DATA */
-        s.ber        = s_last_status.ber;
+
+        /* Prefer the reading taken as the link came up over whatever happens to
+         * be in the previous status: after a recovery the latter is stale and
+         * typically 99 ("unknown"), which showed 0 bars on a working link. */
+        s.rssi = s_last_status.rssi;
+        s.ber  = s_last_status.ber;
+        gsm_get_data_mode_signal(&s.rssi, &s.ber);
         s.net_status = s_last_status.net_status;
         s.bars       = rssi_to_bars(s.rssi);
         memcpy(s.module_info, s_last_status.module_info, sizeof(s.module_info));
@@ -317,7 +322,12 @@ static void poll_and_report(void)
     else if (s.rssi < GSM_RSSI_WEAK_THRESHOLD)       s.fault = GSM_FAULT_WEAK_SIGNAL;
     else if (s.net_status == GSM_NET_DENIED)         s.fault = GSM_FAULT_SIM_BARRED;
     else if (!s.registered)                          s.fault = GSM_FAULT_NO_COVERAGE;
-    else if (!s.data_up && s_ppp_attempted)          s.fault = GSM_FAULT_NO_DATA_LINK;
+    /* Not a fault while a reconnect is pending: the SIM has just come back and
+     * gsm_ppp_start() is about to run. Reporting "set the correct APN" one poll
+     * before the stored APN connects successfully is both wrong and actionable
+     * in the wrong direction. */
+    else if (!s.data_up && s_ppp_attempted && !s_sim_reinserted)
+                                                     s.fault = GSM_FAULT_NO_DATA_LINK;
     else                                             s.fault = GSM_FAULT_NONE;
 
     s_last_status = s;

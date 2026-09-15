@@ -190,6 +190,12 @@ esp_err_t gsm_set_enabled_pref(bool enabled);
 /* Return to pure command mode, dropping the data link. */
 esp_err_t gsm_ppp_stop(void);
 
+/* Signal strength sampled immediately before entering data mode. AT+CSQ cannot
+ * run while PPP owns the UART, so this is the last true reading available for
+ * the session. Returns false if none was obtained, so the caller can avoid
+ * presenting a stale value as if it were current. */
+bool gsm_get_data_mode_signal(uint8_t *rssi, uint8_t *ber);
+
 /**
  * @brief Is the data link usable right now?
  *
