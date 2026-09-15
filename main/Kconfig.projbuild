@@ -376,10 +376,28 @@ menu "NCLite CLEV4"
                 - BSNL:      "bsnlnet"
                 Without correct APN, no data session can be established.
 
+        config NCLE_GSM_LEGACY_AT_HTTP
+            bool "Keep the legacy AT-command HTTP/ping path (AT+QHTTP, AT+QPING)"
+            default n
+            depends on NCLE_GSM_ENABLE
+            help
+                SUPERSEDED by the PPP path (esp_modem + esp_netif). Leave this
+                DISABLED unless you are A/B comparing the two.
+
+                The legacy helpers drive the modem with raw uart_write_bytes()/
+                uart_read_bytes(), because the QHTTPURL/QHTTPPOST flow needs a
+                CONNECT prompt followed by raw payload bytes. esp_modem now owns
+                that UART, so enabling this puts two readers on one RX FIFO: the
+                HTTP helper steals PPP frames and PPP steals the modem's replies.
+                The corruption is intermittent and does NOT fail the build.
+
+                With PPP up, use esp_http_client for HTTP and the lwIP ping
+                instead - that is the whole point of the port.
+
         config NCLE_GSM_HTTP_INSECURE
             bool "Skip TLS certificate verification (HTTPS insecure mode)"
             default y
-            depends on NCLE_GSM_ENABLE
+            depends on NCLE_GSM_LEGACY_AT_HTTP
             help
                 When enabled (default), HTTPS connections skip server
                 certificate verification (seclevel=0). Useful for testing

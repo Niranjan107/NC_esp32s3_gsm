@@ -61,3 +61,12 @@ CONFIG_PM_ENABLE=n
 # Heap Configuration
 CONFIG_HEAP_POISONING_DISABLED=y
 
+# lwIP PPP - required for the GSM modem to be a real network interface
+# (esp_modem + esp_netif), so the application layer can use normal TCP
+# sockets instead of AT-command HTTP. See docs/GSM_PORT_PLAN.md Step 1.
+# NOTE: the committed sdkconfig overrides this file, so it is set in both.
+CONFIG_LWIP_PPP_SUPPORT=y
+CONFIG_LWIP_PPP_NOTIFY_PHASE_SUPPORT=y
+CONFIG_LWIP_PPP_PAP_SUPPORT=y
+CONFIG_LWIP_PPP_CHAP_SUPPORT=y
+

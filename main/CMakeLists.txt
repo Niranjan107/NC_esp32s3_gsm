@@ -14,4 +14,5 @@ idf_component_register(
         ble_spp
         soft_uart_rmt
         wm_uart_validator
+        gsm
 )

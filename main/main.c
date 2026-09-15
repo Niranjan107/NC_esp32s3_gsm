@@ -278,11 +278,15 @@ static void wm_ble_data_callback(const char *json_data, size_t len)
 static void gsm_ble_status_callback(const gsm_status_t *s, void *ctx)
 {
     (void)ctx;
-    static char buf[160];
+    static char buf[256];
+    /* Reports each connectivity stage separately (alive / sim / registered /
+     * data) so the app can show WHICH one failed, rather than one ambiguous
+     * "connected". "data" true means an IP is actually assigned. */
     int n = snprintf(buf, sizeof(buf),
-        "{\"device\":\"gsm\",\"alive\":%d,\"registered\":%d,"
-        "\"rssi\":%d,\"bars\":%d,\"net\":%d}\n",
-        s->alive, s->registered, s->rssi, s->bars, (int)s->net_status);
+        "{\"device\":\"gsm\",\"alive\":%d,\"sim\":\"%s\",\"registered\":%d,"
+        "\"data\":%d,\"rssi\":%d,\"bars\":%d,\"net\":%d,\"iccid\":\"%s\"}\n",
+        s->alive, gsm_sim_status_str(s->sim_status), s->registered,
+        s->data_up, s->rssi, s->bars, (int)s->net_status, s->iccid);
     if (n > 0 && n < (int)sizeof(buf)) {
         ble_spp_output_callback(buf, (unsigned int)n);
     }

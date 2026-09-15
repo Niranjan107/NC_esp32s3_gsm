@@ -1,0 +1,7 @@
+## Managed component dependencies for the GSM connectivity component.
+##
+## esp_modem turns the modem into a real ESP-IDF network interface (esp_netif +
+## PPP), so the application layer can open normal TCP sockets over it instead of
+## driving HTTP with AT commands. See docs/GSM_PORT_PLAN.md Step 1.
+dependencies:
+  espressif/esp_modem: "^1.1.0"

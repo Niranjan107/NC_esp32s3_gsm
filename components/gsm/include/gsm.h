@@ -48,8 +48,89 @@ esp_err_t gsm_get_phone_number(char *number, size_t number_size);
 /* Read SIM card serial number (ICCID) via AT+QCCID. Always available. */
 esp_err_t gsm_get_iccid(char *iccid, size_t iccid_size);
 
-/* ===== Data session (PDP context) ===== */
-/* Activate PDP context using CONFIG_NCLE_GSM_APN. Required before any HTTP/TCP. */
+/* ===== SIM presence ===== */
+typedef enum {
+    GSM_SIM_READY = 0,      /* card present and unlocked  */
+    GSM_SIM_ABSENT,         /* no card in the holder      */
+    GSM_SIM_PIN_REQUIRED,   /* present but PIN/PUK locked */
+    GSM_SIM_ERROR,          /* modem did not answer       */
+} gsm_sim_status_t;
+
+/* Check SIM presence via AT+CPIN?. Call before attempting a data session:
+ * an empty holder otherwise looks like "every APN failed". */
+gsm_sim_status_t gsm_get_sim_status(void);
+const char      *gsm_sim_status_str(gsm_sim_status_t s);
+
+/* ===== Data link (PPP via esp_modem) =====
+ *
+ * These replace the AT-command data path. Once gsm_ppp_start() has run and
+ * gsm_pdp_is_active() reports true, the modem is a normal ESP-IDF network
+ * interface: esp-mqtt and esp_http_client work over it directly.
+ */
+
+/**
+ * @brief Bring the data link up, discovering the APN if necessary.
+ *
+ * Checks modem and SIM presence first, then: stored APN -> each built-in
+ * candidate in turn. The working APN is stored, so later boots connect
+ * immediately; a stored APN that stops working is discarded and the trial
+ * re-runs, so swapping the SIM needs no manual reconfiguration.
+ *
+ * BLOCKING - worst case around two minutes when every APN fails. Call from
+ * gsm_task, never from app_main or a callback.
+ *
+ * @return ESP_OK           PPP up, IP assigned
+ *         ESP_ERR_NOT_FOUND  modem absent, or no APN worked
+ *         ESP_ERR_INVALID_STATE  SIM absent or PIN-locked
+ */
+esp_err_t gsm_ppp_start(void);
+
+/* ===== Connectivity self-test =====
+ *
+ * Both use STANDARD APIs - lwIP's esp_ping and an unmodified esp_http_client -
+ * with no modem-specific transport. That is the point: if the PPP interface is
+ * genuine, ordinary socket code works unchanged. Needing a modem-aware shim
+ * would mean the interface is an AT wrapper, not a real netif.
+ */
+
+/* ICMP ping via lwIP (NOT AT+QPING). host NULL => "8.8.8.8", count 0 => 4.
+ * Returns ESP_OK if at least one reply came back. Blocking. */
+esp_err_t gsm_test_ping(const char *host, uint32_t count);
+
+/* HTTP GET with stock esp_http_client. url NULL => "http://example.com".
+ * Proves TCP + DNS work, which ping alone does not. Blocking. */
+esp_err_t gsm_test_http_get(const char *url);
+
+/* ===== APN configuration (BLE / USB console) ===== */
+
+/* Set the APN explicitly and try to connect with it. The value is stored first,
+ * so a reboot uses it directly. Unlike a trialled APN it is NOT discarded on
+ * failure - the user set it deliberately. */
+esp_err_t gsm_apn_set_and_connect(const char *apn);
+
+/* Store (or clear, with NULL/"") the APN without connecting. */
+esp_err_t gsm_apn_store(const char *apn);
+
+/* Read the stored APN. Returns ESP_ERR_NOT_FOUND when none is set. */
+esp_err_t gsm_apn_get(char *out, size_t out_size);
+
+/* Return to pure command mode, dropping the data link. */
+esp_err_t gsm_ppp_stop(void);
+
+/**
+ * @brief Is the data link usable right now?
+ *
+ * Reports what lwIP believes (PPP got an IP), NOT what an AT command claimed -
+ * a modem can report a PDP context active while no traffic passes. This is
+ * deliberately separate from gsm_get_network_status(): a SIM can be registered
+ * on the network and still have no working data connection (expired data pack),
+ * and the field team needs to see which of the two failed.
+ */
+bool gsm_pdp_is_active(void);
+
+/* ===== Data session (PDP context) — legacy AT path ===== */
+/* Activate PDP context using CONFIG_NCLE_GSM_APN. Required before the
+ * AT-command HTTP helpers below. Not needed for the PPP path above. */
 esp_err_t gsm_pdp_activate(void);
 esp_err_t gsm_pdp_deactivate(void);
 

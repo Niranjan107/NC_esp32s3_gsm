@@ -7,6 +7,12 @@ set(EXTRA_COMPONENT_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/components"
 )
 
+# This board has no display. esp_lcd is unused, and its RGB panel driver makes
+# the xtensa GCC 14.2 build crash (internal compiler error in the `ira` pass on
+# esp_lcd_panel_rgb.c), so exclude it from the build entirely.
+# Same exclusion as the WiFi sister project - same board, same toolchain.
+set(EXCLUDE_COMPONENTS esp_lcd)
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 project(NCLite_ESP32S3)

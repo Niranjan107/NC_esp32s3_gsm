@@ -12,6 +12,23 @@
 #include "freertos/semphr.h"
 #include "sdkconfig.h"
 
+/* esp_modem owns the UART once gsm_init() has run: it installs its own DTE on
+ * GSM_UART_NUM. Nothing in this file may call uart_driver_install() or the raw
+ * uart_read_bytes()/uart_write_bytes() path on that port any more - two drivers
+ * on one UART either fail at install or silently corrupt RX, and once PPP is up
+ * raw reads would consume PPP frames. All AT traffic goes through
+ * esp_modem_at(), which is CMUX-safe. See docs/GSM_PORT_PLAN.md Step 1. */
+#include "esp_modem_api.h"
+#include "esp_netif.h"
+#include "esp_netif_ppp.h"
+#include "esp_event.h"
+#include "esp_timer.h"
+#include "nvs.h"
+#include <inttypes.h>
+#include "ping/ping_sock.h"
+#include "lwip/inet.h"
+#include "esp_http_client.h"
+
 static const char *TAG = "GSM";
 
 #define GSM_UART_NUM        CONFIG_NCLE_GSM_UART_NUM
@@ -38,6 +55,142 @@ static const char *TAG = "GSM";
 static bool s_initialized = false;
 static SemaphoreHandle_t s_uart_mutex = NULL;
 
+/* esp_modem handles. s_dce is the modem itself; s_ppp_netif is the lwIP
+ * interface it feeds once we switch to data mode. */
+static esp_modem_dce_t  *s_dce       = NULL;
+static esp_netif_t      *s_ppp_netif = NULL;
+
+/* Set true only by the IP_EVENT_PPP_GOT_IP handler and cleared on LOST_IP, so
+ * it reflects what lwIP actually believes - not what an AT command claimed.
+ * gsm_pdp_is_active() reports this. */
+static volatile bool s_ppp_got_ip = false;
+
+/* ============================================================================
+ * APN selection
+ * ============================================================================
+ * Deliberately NOT an IMSI/MCC-MNC lookup table. Identifying the carrier from
+ * the SIM tells you the CARRIER, not whether an APN actually carries traffic -
+ * an Airtel M2M SIM matches "Airtel" perfectly and then fails, because it needs
+ * airteliot.com rather than airtelgprs.com. Trying APNs in order tests the only
+ * thing that matters: does a data session come up.
+ *
+ * Order of preference:
+ *   1. APN stored in NVS (set over BLE/USB, or learned from a previous success)
+ *   2. Each candidate below, in turn, until PDP activation succeeds
+ *   3. On success the winner is written to NVS, so later boots skip the trial
+ *
+ * A stored APN that stops working (SIM swapped, carrier changed) is retried
+ * once and then discarded, falling back to the trial - so a SIM swap needs no
+ * manual reconfiguration.
+ * ===========================================================================*/
+#define GSM_NVS_NAMESPACE   "gsm"
+#define GSM_NVS_KEY_APN     "apn"
+#define GSM_APN_MAX_LEN     64
+
+/* Ordered by how likely they are to be the right answer on this product.
+ * airteliot.com is included because Airtel IoT/M2M SIMs - the kind normally
+ * bought for machines like this - do not use the consumer APN. */
+static const char *const GSM_APN_CANDIDATES[] = {
+    "airtelgprs.com",   /* Airtel consumer          */
+    "jionet",           /* Jio                      */
+    "bsnlnet",          /* BSNL / MTNL              */
+    "www",              /* Vi (Vodafone Idea)       */
+    "airteliot.com",    /* Airtel IoT / M2M         */
+};
+#define GSM_APN_CANDIDATE_COUNT \
+    (sizeof(GSM_APN_CANDIDATES) / sizeof(GSM_APN_CANDIDATES[0]))
+
+/**
+ * @brief Read the stored APN, if any.
+ *
+ * OUTPUT:
+ * @return true when a non-empty APN was loaded into out.
+ */
+static bool gsm_apn_load(char *out, size_t out_size)
+{
+    nvs_handle_t nvs;
+    size_t len = out_size;
+
+    if (nvs_open(GSM_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        return false;
+    }
+    esp_err_t err = nvs_get_str(nvs, GSM_NVS_KEY_APN, out, &len);
+    nvs_close(nvs);
+
+    return (err == ESP_OK && out[0] != '\0');
+}
+
+/**
+ * @brief Persist an APN so later boots skip the trial.
+ *
+ * INPUT:
+ * @param apn  APN string, or NULL/"" to clear a stored value that stopped working
+ */
+esp_err_t gsm_apn_store(const char *apn)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(GSM_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+
+    if (apn == NULL || apn[0] == '\0') {
+        err = nvs_erase_key(nvs, GSM_NVS_KEY_APN);
+        if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;   /* nothing to clear */
+        ESP_LOGI(TAG, "APN cleared from NVS");
+    } else {
+        err = nvs_set_str(nvs, GSM_NVS_KEY_APN, apn);
+        ESP_LOGI(TAG, "APN stored in NVS: %s", apn);
+    }
+
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err;
+}
+
+esp_err_t gsm_apn_get(char *out, size_t out_size)
+{
+    if (out == NULL || out_size == 0) return ESP_ERR_INVALID_ARG;
+    out[0] = '\0';
+    return gsm_apn_load(out, out_size) ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+/* PPP/IP event handler: the single source of truth for "is the data link up".
+ * Registered in gsm_init(), so the flag is correct even if PPP drops on its own. */
+static void gsm_ip_event_handler(void *arg, esp_event_base_t base,
+                                 int32_t event_id, void *event_data)
+{
+    switch (event_id) {
+        case IP_EVENT_PPP_GOT_IP: {
+            ip_event_got_ip_t *e = (ip_event_got_ip_t *)event_data;
+            esp_netif_dns_info_t dns1 = {0}, dns2 = {0};
+            esp_netif_get_dns_info(e->esp_netif, ESP_NETIF_DNS_MAIN, &dns1);
+            esp_netif_get_dns_info(e->esp_netif, ESP_NETIF_DNS_BACKUP, &dns2);
+
+            ESP_LOGI(TAG, "=== PPP GOT IP ===");
+            ESP_LOGI(TAG, "  IP      : " IPSTR, IP2STR(&e->ip_info.ip));
+            ESP_LOGI(TAG, "  Gateway : " IPSTR, IP2STR(&e->ip_info.gw));
+            ESP_LOGI(TAG, "  Netmask : " IPSTR, IP2STR(&e->ip_info.netmask));
+            ESP_LOGI(TAG, "  DNS1    : " IPSTR, IP2STR(&dns1.ip.u_addr.ip4));
+            ESP_LOGI(TAG, "  DNS2    : " IPSTR, IP2STR(&dns2.ip.u_addr.ip4));
+            s_ppp_got_ip = true;
+            break;
+        }
+        case IP_EVENT_PPP_LOST_IP:
+            ESP_LOGW(TAG, "PPP lost IP - data link is down");
+            s_ppp_got_ip = false;
+            break;
+        default:
+            break;
+    }
+}
+
+bool gsm_pdp_is_active(void)
+{
+    /* Deliberately reports the lwIP view, not an AT-command claim: a modem can
+     * report a PDP context active while no traffic passes. Registration state
+     * is a separate question - see gsm_get_network_status(). */
+    return s_ppp_got_ip;
+}
+
 static void gsm_gpio_init(void)
 {
     gpio_config_t io_conf = {
@@ -62,28 +215,620 @@ static void gsm_gpio_init(void)
             );
 }
 
-static void gsm_uart_init(void)
+/**
+ * @brief Create the esp_modem DTE/DCE and the PPP netif. Replaces the old
+ *        gsm_uart_init(): esp_modem installs the UART driver itself.
+ *
+ * The DCE is created in COMMAND mode, so every existing AT helper keeps working
+ * exactly as before. Data mode is entered separately by gsm_ppp_start().
+ *
+ * OUTPUT:
+ * @return ESP_OK when the DCE and netif exist, error otherwise.
+ */
+/* esp_modem logs "Rx Break" (esp_modem_uart.cpp) for EVERY break event. An
+ * unpowered modem holds its TX line low, which the UART reports as a continuous
+ * break - thousands of identical warnings that bury every useful line in the
+ * log, which is exactly when you are trying to read it.
+ *
+ * Rather than silence the condition (a real wiring fault would then be
+ * invisible), demote esp_modem's per-event warning and report the SAME
+ * information once every few seconds with a count. One line instead of a
+ * thousand, and the count says more than any single event could: a steady rate
+ * means an unpowered modem, a sporadic one means a flaky connection. */
+#define GSM_BREAK_REPORT_INTERVAL_MS  5000
+
+static void gsm_quiet_uart_break_spam(void)
 {
-    uart_config_t uart_config = {
-        .baud_rate  = GSM_UART_BAUD_RATE,
-        .data_bits  = UART_DATA_8_BITS,
-        .parity     = UART_PARITY_DISABLE,
-        .stop_bits  = UART_STOP_BITS_1,
-        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
+    /* esp_modem's UART terminal tag. Errors still print. */
+    esp_log_level_set("uart_terminal", ESP_LOG_ERROR);
+}
+
+/* Called from the poll loop and the init retry path to emit the summary. */
+static void gsm_report_line_state(void)
+{
+    static int64_t last_report_us = 0;
+    int64_t now = esp_timer_get_time();
+
+    if (last_report_us == 0) {
+        last_report_us = now;
+        return;
+    }
+    if ((now - last_report_us) < (GSM_BREAK_REPORT_INTERVAL_MS * 1000)) {
+        return;
+    }
+    last_report_us = now;
+
+    /* A break condition means RX has been held low. If the modem is answering
+     * AT commands the line is obviously fine, so only report when it is not. */
+    if (s_dce && !s_ppp_got_ip && esp_modem_sync(s_dce) != ESP_OK) {
+        ESP_LOGW(TAG, "UART RX idle-low - modem unpowered or TX disconnected "
+                      "(check GPIO%d <- module TX, and module power 3.8-4.2V)",
+                 GSM_UART_RX_PIN);
+    }
+}
+
+static esp_err_t gsm_modem_init(void)
+{
+    if (s_dce != NULL) return ESP_OK;      /* already built */
+
+    gsm_quiet_uart_break_spam();
+
+    /* The APN passed here is only a placeholder: gsm_ppp_start() calls
+     * esp_modem_set_apn() with the stored or trialled value before entering
+     * data mode. Using the Kconfig value keeps the DCE config valid until then. */
+    const char *initial_apn = CONFIG_NCLE_GSM_APN;
+
+    /* PPP netif - this is what makes the modem a first-class ESP-IDF interface,
+     * so esp-mqtt / esp_http_client can open ordinary sockets over it. */
+    esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_PPP();
+    s_ppp_netif = esp_netif_new(&netif_cfg);
+    if (s_ppp_netif == NULL) {
+        ESP_LOGE(TAG, "esp_netif_new(PPP) failed");
+        return ESP_FAIL;
+    }
+
+    esp_modem_dte_config_t dte_cfg = ESP_MODEM_DTE_DEFAULT_CONFIG();
+    dte_cfg.uart_config.port_num   = GSM_UART_NUM;
+    dte_cfg.uart_config.tx_io_num  = GSM_UART_TX_PIN;
+    dte_cfg.uart_config.rx_io_num  = GSM_UART_RX_PIN;
+    dte_cfg.uart_config.rts_io_num = UART_PIN_NO_CHANGE;
+    dte_cfg.uart_config.cts_io_num = UART_PIN_NO_CHANGE;
+    dte_cfg.uart_config.flow_control = ESP_MODEM_FLOW_CONTROL_NONE;
+    dte_cfg.uart_config.baud_rate  = GSM_UART_BAUD_RATE;
+    dte_cfg.uart_config.rx_buffer_size = GSM_RX_BUFFER_SIZE;
+    dte_cfg.uart_config.tx_buffer_size = GSM_TX_BUFFER_SIZE;
+
+    esp_modem_dce_config_t dce_cfg = ESP_MODEM_DCE_DEFAULT_CONFIG(initial_apn);
+
+    /* EC200U speaks the standard Quectel/BG96 command set for the parts
+     * esp_modem drives (CGDATA, CMUX, CSQ, CREG). */
+    s_dce = esp_modem_new_dev(ESP_MODEM_DCE_BG96, &dte_cfg, &dce_cfg, s_ppp_netif);
+    if (s_dce == NULL) {
+        ESP_LOGE(TAG, "esp_modem_new_dev failed");
+        esp_netif_destroy(s_ppp_netif);
+        s_ppp_netif = NULL;
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "esp_modem DTE created: UART%d TX=%d RX=%d @%d",
+             GSM_UART_NUM, GSM_UART_TX_PIN, GSM_UART_RX_PIN, GSM_UART_BAUD_RATE);
+    return ESP_OK;
+}
+
+/**
+ * @brief Is a SIM present and ready? (AT+CPIN?)
+ *
+ * OUTPUT:
+ * @return GSM_SIM_READY        card present and unlocked
+ *         GSM_SIM_ABSENT       no card in the holder
+ *         GSM_SIM_PIN_REQUIRED card present but locked
+ *         GSM_SIM_ERROR        modem did not answer
+ */
+gsm_sim_status_t gsm_get_sim_status(void)
+{
+    char resp[128] = {0};
+    bool saw_absent = false;
+
+    /* The SIM interface is not ready the instant the modem boots or resets: the
+     * module answers "+CME ERROR: 14" (SIM busy) for a second or two while it
+     * initialises the card. Treating that as "no SIM" reports a hardware fault
+     * that does not exist, so retry a few times before concluding anything. */
+    for (int attempt = 0; attempt < 5; attempt++) {
+        resp[0] = '\0';
+        esp_err_t err = gsm_send_at_command("+CPIN?", resp, sizeof(resp), 5000);
+
+        if (err == ESP_OK) {
+            if (strstr(resp, "READY")) return GSM_SIM_READY;
+            if (strstr(resp, "SIM PIN") || strstr(resp, "SIM PUK")) {
+                return GSM_SIM_PIN_REQUIRED;
+            }
+            ESP_LOGW(TAG, "Unrecognised +CPIN? reply: %s", resp);
+            return GSM_SIM_ERROR;
+        }
+
+        /* Non-OK: the reply text distinguishes the real cases.
+         *   CME 12 = SIM PUK required   -> genuinely locked, definitive
+         *   CME 13 = SIM failure        -> genuinely faulty, definitive
+         *   CME 10 = SIM not inserted   -> NOT definitive, see below
+         *   CME 14 = SIM busy           -> transient by definition
+         */
+        if (strstr(resp, "+CME ERROR: 12")) return GSM_SIM_PIN_REQUIRED;
+        if (strstr(resp, "+CME ERROR: 13")) return GSM_SIM_ERROR;
+
+        /* CME 10 is reported as "SIM not inserted", but a freshly booted module
+         * answers 10 for a moment before its SIM interface comes up - observed
+         * on this EC200U returning 10 and then READY 70 ms later. Treating the
+         * first answer as final reported "no SIM" on a device that went on to
+         * open a working data session: a contradiction that would send someone
+         * to site to check a SIM that was fine. So retry it like 14, and only
+         * conclude ABSENT if it persists across every attempt. */
+        if (strstr(resp, "+CME ERROR: 10")) {
+            ESP_LOGI(TAG, "SIM reported absent, re-checking (%d/5)...", attempt + 1);
+            saw_absent = true;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        if (strstr(resp, "+CME ERROR: 14")) {
+            ESP_LOGI(TAG, "SIM busy, retrying (%d/5)...", attempt + 1);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        /* Anything else (no reply at all) - retry, the modem may still be
+         * settling after a reset. */
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    /* Persistently "not inserted" across every attempt: now believe it. */
+    if (saw_absent) {
+        ESP_LOGW(TAG, "SIM absent (consistent across retries)");
+        return GSM_SIM_ABSENT;
+    }
+
+    ESP_LOGW(TAG, "SIM status unresolved after retries: %s", resp);
+    return GSM_SIM_ERROR;
+}
+
+const char *gsm_sim_status_str(gsm_sim_status_t s)
+{
+    switch (s) {
+        case GSM_SIM_READY:        return "ready";
+        case GSM_SIM_ABSENT:       return "absent";
+        case GSM_SIM_PIN_REQUIRED: return "pin_required";
+        default:                   return "error";
+    }
+}
+
+/* Tear down the DCE and PPP netif. Safe to call when they were never created. */
+static void gsm_modem_deinit(void)
+{
+    /* Unregister before destroying the netif, so a late PPP event cannot fire
+     * into a freed interface. Also stops "handler already registered,
+     * overwriting" warnings leaking a handler slot on every reinit. */
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_PPP_GOT_IP,
+                                 &gsm_ip_event_handler);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_PPP_LOST_IP,
+                                 &gsm_ip_event_handler);
+
+    if (s_dce) {
+        esp_modem_destroy(s_dce);
+        s_dce = NULL;
+    }
+    if (s_ppp_netif) {
+        esp_netif_destroy(s_ppp_netif);
+        s_ppp_netif = NULL;
+    }
+    s_ppp_got_ip = false;
+}
+
+/* How long to wait for PPP to hand us an IP after switching to CMUX, before
+ * declaring this APN a failure and moving to the next candidate. PDP activation
+ * on a good link is a few seconds; 20s is generous without stalling the trial. */
+/* A good link hands over an IP in ~6s. 30s leaves room for a slow PDP
+ * activation or a congested cell without stalling the whole trial. */
+#define GSM_PPP_IP_TIMEOUT_MS   30000
+
+/**
+ * @brief Try ONE APN: set it, switch to CMUX, wait for an IP.
+ *
+ * OUTPUT:
+ * @return ESP_OK if an IP arrived within GSM_PPP_IP_TIMEOUT_MS.
+ */
+/**
+ * @brief Return the modem to a usable command-mode state after a failed CMUX
+ *        or PPP attempt.
+ *
+ * WHY THIS IS NOT JUST set_mode(COMMAND): when a CMUX switch fails or PPP never
+ * negotiates, the modem can be left mid-protocol - still framing CMUX, or with
+ * lwIP holding the PPP session half-open. The ESP32 then sees a continuous
+ * stream of line breaks ("uart_terminal: Rx Break") and EVERY later AT command
+ * fails, so one bad APN attempt poisons the UART for everything after it.
+ *
+ * Stopping the netif first, then dropping to command mode, then draining
+ * whatever noise is still in the RX FIFO, leaves the port genuinely clean for
+ * the next attempt.
+ */
+static void gsm_cmux_teardown(void)
+{
+    if (s_dce == NULL) return;
+
+    /* 1. Take PPP down from the lwIP side so it stops driving the link. */
+    if (s_ppp_netif) {
+        esp_netif_action_stop(s_ppp_netif, NULL, 0, NULL);
+    }
+    s_ppp_got_ip = false;
+
+    /* 2. Back to plain command mode. */
+    esp_modem_set_mode(s_dce, ESP_MODEM_MODE_COMMAND);
+    vTaskDelay(pdMS_TO_TICKS(500));      /* let the modem settle */
+
+    /* 3. Drain any residual framing bytes so the next AT reply is not prefixed
+     * with junk from the aborted session. */
+    uart_flush_input(GSM_UART_NUM);
+
+    /* 4. Confirm the modem is actually answering again. If not, the caller's
+     * next command will fail and the task's dead-modem recovery takes over. */
+    for (int i = 0; i < 3; i++) {
+        if (esp_modem_sync(s_dce) == ESP_OK) {
+            ESP_LOGI(TAG, "command mode restored");
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    ESP_LOGW(TAG, "modem not answering after CMUX teardown");
+}
+
+static esp_err_t gsm_ppp_try_apn(const char *apn, bool first_attempt)
+{
+    ESP_LOGI(TAG, "--- trying APN '%s' ---", apn);
+
+    /* Only clean up when a PREVIOUS attempt could have left the modem in a bad
+     * state. On the first attempt the modem is already in command mode from
+     * gsm_init(), and running the teardown here costs ~8.5s of the connection
+     * budget for nothing - which was enough to turn a working 6s connect into
+     * a 20s timeout. */
+    if (!first_attempt) {
+        gsm_cmux_teardown();
+    }
+    s_ppp_got_ip = false;
+
+    esp_err_t err = esp_modem_set_apn(s_dce, apn);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "set_apn('%s') failed: 0x%x", apn, err);
+        return err;
+    }
+
+    /* Plain DATA mode, NOT CMUX.
+     *
+     * CMUX was the original choice, so RSSI polling could share the UART with
+     * PPP. On this EC200U it proved unstable: seconds after PPP connected the
+     * link collapsed into a continuous "Restarting CMUX state machine
+     * (reason: 6)" storm, the AT channel went blind (AT+CSQ returning a bare
+     * OK), and tearing the modem down mid-storm crashed the device.
+     *
+     * A stable data link with no RSSI polling beats an unstable one with it.
+     * While PPP is up, gsm_task stops issuing AT commands entirely and reports
+     * the link from the netif instead - which is what the four-state model
+     * actually needs. Signal strength resumes when the link is down. */
+    err = esp_modem_set_mode(s_dce, ESP_MODEM_MODE_DATA);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "DATA switch failed for '%s': 0x%x", apn, err);
+        gsm_cmux_teardown();     /* half-switched mode would poison the UART */
+        return err;
+    }
+
+    /* Wait for the IP_EVENT_PPP_GOT_IP handler to fire. */
+    const TickType_t step = pdMS_TO_TICKS(250);
+    int waited_ms = 0;
+    while (waited_ms < GSM_PPP_IP_TIMEOUT_MS) {
+        if (s_ppp_got_ip) {
+            ESP_LOGI(TAG, "APN '%s' WORKED (IP in %d ms)", apn, waited_ms);
+            return ESP_OK;
+        }
+        vTaskDelay(step);
+        waited_ms += 250;
+    }
+
+    ESP_LOGW(TAG, "APN '%s' gave no IP after %d ms", apn, GSM_PPP_IP_TIMEOUT_MS);
+    gsm_cmux_teardown();
+    return ESP_ERR_TIMEOUT;
+}
+
+/**
+ * @brief Bring the data link up, discovering the APN if necessary.
+ *
+ * Order: stored APN (fast path) -> each candidate in turn. On success the
+ * working APN is stored, so subsequent boots connect immediately. A stored APN
+ * that has stopped working is discarded and the trial re-runs, so swapping the
+ * SIM needs no manual reconfiguration.
+ *
+ * NOTE: blocking. Worst case is roughly
+ *       (1 + GSM_APN_CANDIDATE_COUNT) * GSM_PPP_IP_TIMEOUT_MS, so call it from
+ *       gsm_task, never from app_main or a callback.
+ *
+ * OUTPUT:
+ * @return ESP_OK when PPP is up and an IP has been assigned.
+ *         ESP_ERR_NOT_FOUND when every APN failed - the caller should report
+ *         "APN required" so the field team can set one over BLE/USB.
+ */
+esp_err_t gsm_ppp_start(void)
+{
+    if (s_dce == NULL) return ESP_ERR_INVALID_STATE;
+
+    /* Preconditions, checked in dependency order. Without these a missing modem
+     * or an empty SIM holder would spend ~2 minutes failing every APN in turn
+     * and then report "no APN worked" - which sends the field team looking for
+     * a carrier problem that does not exist. Each check below fails in seconds
+     * and names the actual fault. */
+
+    /* 1. Is the modem there and answering? */
+    if (!gsm_is_alive()) {
+        ESP_LOGE(TAG, "Modem not responding - check power, wiring and PWRKEY");
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    /* 2. Is a SIM present and unlocked? */
+    gsm_sim_status_t sim = gsm_get_sim_status();
+    if (sim != GSM_SIM_READY) {
+        ESP_LOGE(TAG, "SIM not usable: %s", gsm_sim_status_str(sim));
+        if (sim == GSM_SIM_ABSENT) {
+            ESP_LOGE(TAG, "  -> insert a SIM card");
+        } else if (sim == GSM_SIM_PIN_REQUIRED) {
+            ESP_LOGE(TAG, "  -> SIM is PIN-locked; disable the PIN on a phone");
+        }
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* 3. Registered on a network? Not fatal - registration can complete while
+     * we are trying APNs - but log it, because "no APN worked" on an
+     * unregistered SIM means no coverage, not a wrong APN. */
+    gsm_network_status_t net = GSM_NET_UNKNOWN;
+    if (gsm_get_network_status(&net) == ESP_OK) {
+        bool registered = (net == GSM_NET_REGISTERED_HOME ||
+                           net == GSM_NET_REGISTERED_ROAMING);
+        if (!registered) {
+            ESP_LOGW(TAG, "Not registered yet (CREG=%d) - APN trial may fail "
+                          "for lack of coverage rather than a wrong APN", net);
+        }
+    }
+
+    char stored[GSM_APN_MAX_LEN] = {0};
+
+    /* 1. Fast path: an APN we were given, or learned last time. */
+    bool first = true;
+
+    if (gsm_apn_load(stored, sizeof(stored))) {
+        ESP_LOGI(TAG, "Using stored APN: %s", stored);
+        if (gsm_ppp_try_apn(stored, first) == ESP_OK) {
+            return ESP_OK;
+        }
+        first = false;
+        ESP_LOGW(TAG, "Stored APN '%s' no longer works - re-running trial", stored);
+        gsm_apn_store(NULL);      /* discard, so a SIM swap self-heals */
+    }
+
+    /* 2. Trial: first candidate that yields an IP wins. */
+    ESP_LOGI(TAG, "Trying %d candidate APNs...", (int)GSM_APN_CANDIDATE_COUNT);
+    for (size_t i = 0; i < GSM_APN_CANDIDATE_COUNT; i++) {
+        if (gsm_ppp_try_apn(GSM_APN_CANDIDATES[i], first) == ESP_OK) {
+            gsm_apn_store(GSM_APN_CANDIDATES[i]);   /* 3. remember the winner */
+            return ESP_OK;
+        }
+        first = false;
+    }
+
+    ESP_LOGE(TAG, "========================================");
+    ESP_LOGE(TAG, "No APN worked. Possible causes:");
+    ESP_LOGE(TAG, "  - SIM has no active data plan");
+    ESP_LOGE(TAG, "  - M2M/enterprise SIM with a private APN");
+    ESP_LOGE(TAG, "    -> set it over BLE/USB: {\"command\":\"apn_config\",...}");
+    ESP_LOGE(TAG, "  - not registered on the network (check gsm_get_network_status)");
+    ESP_LOGE(TAG, "========================================");
+    return ESP_ERR_NOT_FOUND;
+}
+
+/* ============================================================================
+ * Connectivity self-test (Step 1 definition-of-done)
+ * ============================================================================
+ * These use the STANDARD lwIP and ESP-IDF APIs on purpose - esp_ping and an
+ * unmodified esp_http_client, with no modem-specific transport and no AT+Q...
+ * anywhere in the path. That is the whole point: if the PPP port is real,
+ * ordinary socket code works unchanged. If any of this needed a modem-aware
+ * shim, the interface would be an AT wrapper wearing a socket costume.
+ * ===========================================================================*/
+
+typedef struct {
+    uint32_t          transmitted;
+    uint32_t          received;
+    uint32_t          total_time_ms;
+    SemaphoreHandle_t done;
+} gsm_ping_ctx_t;
+
+static void gsm_ping_on_success(esp_ping_handle_t hdl, void *args)
+{
+    uint8_t  ttl;
+    uint16_t seqno;
+    uint32_t elapsed_ms;
+    ip_addr_t target;
+
+    esp_ping_get_profile(hdl, ESP_PING_PROF_SEQNO,   &seqno,      sizeof(seqno));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_TTL,     &ttl,        sizeof(ttl));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_IPADDR,  &target,     sizeof(target));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_TIMEGAP, &elapsed_ms, sizeof(elapsed_ms));
+
+    ESP_LOGI(TAG, "  reply from %s: seq=%d ttl=%d time=%" PRIu32 " ms",
+             ipaddr_ntoa(&target), seqno, ttl, elapsed_ms);
+}
+
+static void gsm_ping_on_timeout(esp_ping_handle_t hdl, void *args)
+{
+    uint16_t seqno;
+    esp_ping_get_profile(hdl, ESP_PING_PROF_SEQNO, &seqno, sizeof(seqno));
+    ESP_LOGW(TAG, "  seq=%d TIMEOUT", seqno);
+}
+
+static void gsm_ping_on_end(esp_ping_handle_t hdl, void *args)
+{
+    gsm_ping_ctx_t *ctx = (gsm_ping_ctx_t *)args;
+
+    esp_ping_get_profile(hdl, ESP_PING_PROF_REQUEST, &ctx->transmitted,
+                         sizeof(ctx->transmitted));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_REPLY, &ctx->received,
+                         sizeof(ctx->received));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_DURATION, &ctx->total_time_ms,
+                         sizeof(ctx->total_time_ms));
+    xSemaphoreGive(ctx->done);
+}
+
+esp_err_t gsm_test_ping(const char *host, uint32_t count)
+{
+    if (!gsm_pdp_is_active()) {
+        ESP_LOGE(TAG, "ping: no data link");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (host == NULL) host = "8.8.8.8";
+    if (count == 0)   count = 4;
+
+    ip_addr_t target;
+    if (!ipaddr_aton(host, &target)) {
+        ESP_LOGE(TAG, "ping: bad address '%s'", host);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    gsm_ping_ctx_t ctx = {0};
+    ctx.done = xSemaphoreCreateBinary();
+    if (ctx.done == NULL) return ESP_ERR_NO_MEM;
+
+    esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+    cfg.target_addr = target;
+    cfg.count       = count;
+    cfg.timeout_ms  = 5000;
+    cfg.interval_ms = 1000;
+
+    esp_ping_callbacks_t cbs = {
+        .on_ping_success = gsm_ping_on_success,
+        .on_ping_timeout = gsm_ping_on_timeout,
+        .on_ping_end     = gsm_ping_on_end,
+        .cb_args         = &ctx,
     };
 
-    ESP_ERROR_CHECK(uart_driver_install(GSM_UART_NUM,
-                                        GSM_RX_BUFFER_SIZE,
-                                        GSM_TX_BUFFER_SIZE,
-                                        0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(GSM_UART_NUM, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(GSM_UART_NUM,
-                                 GSM_UART_TX_PIN, GSM_UART_RX_PIN,
-                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    esp_ping_handle_t ping;
+    esp_err_t err = esp_ping_new_session(&cfg, &cbs, &ping);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ping: session create failed 0x%x", err);
+        vSemaphoreDelete(ctx.done);
+        return err;
+    }
 
-    ESP_LOGI(TAG, "UART: TX=%d, RX=%d, Baud=%d",
-             GSM_UART_TX_PIN, GSM_UART_RX_PIN, GSM_UART_BAUD_RATE);
+    ESP_LOGI(TAG, "=== PING %s (%" PRIu32 " packets, lwIP not AT+QPING) ===",
+             host, count);
+    esp_ping_start(ping);
+
+    /* count * (interval + timeout) plus slack */
+    TickType_t wait = pdMS_TO_TICKS(count * 6000 + 5000);
+    if (xSemaphoreTake(ctx.done, wait) != pdTRUE) {
+        ESP_LOGW(TAG, "ping: did not finish in time");
+    }
+    esp_ping_stop(ping);
+    esp_ping_delete_session(ping);
+    vSemaphoreDelete(ctx.done);
+
+    uint32_t loss = (ctx.transmitted > 0)
+                    ? (100 * (ctx.transmitted - ctx.received)) / ctx.transmitted
+                    : 100;
+
+    ESP_LOGI(TAG, "=== PING RESULT: %" PRIu32 " sent, %" PRIu32 " received, "
+                  "%" PRIu32 "%% loss, %" PRIu32 " ms total ===",
+             ctx.transmitted, ctx.received, loss, ctx.total_time_ms);
+
+    return (ctx.received > 0) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t gsm_test_http_get(const char *url)
+{
+    if (!gsm_pdp_is_active()) {
+        ESP_LOGE(TAG, "http: no data link");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (url == NULL) url = "http://example.com";
+
+    ESP_LOGI(TAG, "=== HTTP GET %s (stock esp_http_client) ===", url);
+
+    /* Deliberately the plain ESP-IDF client with default transport. No modem
+     * special-casing: this is the test that separates a real socket interface
+     * from an AT wrapper. */
+    esp_http_client_config_t cfg = {
+        .url         = url,
+        .method      = HTTP_METHOD_GET,
+        .timeout_ms  = 15000,
+        .buffer_size = 1024,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "http: client init failed");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        int status = esp_http_client_get_status_code(client);
+        int len    = esp_http_client_get_content_length(client);
+        ESP_LOGI(TAG, "=== HTTP RESULT: status=%d, content-length=%d ===",
+                 status, len);
+        if (status < 200 || status >= 400) err = ESP_FAIL;
+    } else {
+        ESP_LOGE(TAG, "=== HTTP FAILED: %s ===", esp_err_to_name(err));
+    }
+
+    esp_http_client_cleanup(client);
+    return err;
+}
+
+/**
+ * @brief Set the APN explicitly (from BLE/USB console) and bring the link up.
+ *
+ * Stores the APN first, so a reboot uses it directly. On failure the stored
+ * value is kept - the user set it deliberately, so it is not silently discarded;
+ * the caller reports the failure instead.
+ */
+esp_err_t gsm_apn_set_and_connect(const char *apn)
+{
+    if (apn == NULL || apn[0] == '\0') return ESP_ERR_INVALID_ARG;
+    if (s_dce == NULL) return ESP_ERR_INVALID_STATE;
+
+    esp_err_t err = gsm_apn_store(apn);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Could not persist APN '%s': 0x%x", apn, err);
+    }
+
+    /* Not a first attempt: the caller may be switching APN while a previous
+     * session is up, so clean up first. */
+    return gsm_ppp_try_apn(apn, false);
+}
+
+/** Return the modem to pure command mode, dropping the data link. */
+esp_err_t gsm_ppp_stop(void)
+{
+    if (s_dce == NULL) return ESP_ERR_INVALID_STATE;
+
+    /* Bring the netif down BEFORE the mode switch, so lwIP stops handing PPP
+     * frames to a modem that is no longer in data mode. Doing it the other way
+     * round leaves esp_modem's worker processing a stream that has changed
+     * meaning underneath it. */
+    if (s_ppp_netif) {
+        esp_netif_action_stop(s_ppp_netif, NULL, 0, NULL);
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    s_ppp_got_ip = false;
+
+    esp_err_t err = esp_modem_set_mode(s_dce, ESP_MODEM_MODE_COMMAND);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_modem_set_mode(COMMAND) failed: 0x%x", err);
+    }
+    vTaskDelay(pdMS_TO_TICKS(300));    /* let the worker settle */
+    return err;
 }
 
 esp_err_t gsm_power_on(void)
@@ -131,94 +876,87 @@ esp_err_t gsm_reset(void)
     return ESP_OK;
 }
 
-static int gsm_read_response(char *buffer, size_t buffer_size, uint32_t timeout_ms)
+/**
+ * @brief Send one AT command through esp_modem and capture the reply.
+ *
+ * Signature and semantics are unchanged from the raw-UART version, so every
+ * caller (the four diagnostic helpers, gsm_task.c, cmd_parser) works as before.
+ * Only the transport underneath changed: esp_modem owns the UART, and this call
+ * is safe while PPP is up because esp_modem multiplexes it (CMUX) instead of
+ * stealing bytes from the data stream.
+ *
+ * INPUT:
+ * @param command       AT command WITHOUT the "AT" prefix (e.g. "+CSQ")
+ * @param response      optional buffer for the reply; may be NULL
+ * @param response_size size of response
+ * @param timeout_ms    how long to wait for the reply
+ *
+ * OUTPUT:
+ * @return ESP_OK on a successful command, ESP_ERR_TIMEOUT on no/failed reply,
+ *         ESP_ERR_INVALID_STATE before gsm_init().
+ */
+esp_err_t gsm_send_at_command(const char *command, char *response,
+                              size_t response_size, uint32_t timeout_ms)
 {
-    int total = 0;
-    TickType_t start = xTaskGetTickCount();
+    if (s_dce == NULL) return ESP_ERR_INVALID_STATE;
+    if (command == NULL) return ESP_ERR_INVALID_ARG;
 
-    while (total < (int)(buffer_size - 1)) {
-        TickType_t elapsed = (xTaskGetTickCount() - start) * portTICK_PERIOD_MS;
-        if (elapsed >= timeout_ms) break;
-
-        int len = uart_read_bytes(GSM_UART_NUM,
-                                  (uint8_t *)(buffer + total),
-                                  buffer_size - 1 - total,
-                                  pdMS_TO_TICKS(200));
-        if (len > 0) {
-            total += len;
-        } else {
-            break;
-        }
+    /* The mutex still serialises callers against each other. esp_modem is
+     * internally thread-safe, but keeping the mutex preserves the previous
+     * ordering guarantees for multi-step AT flows. */
+    if (xSemaphoreTake(s_uart_mutex, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to acquire AT mutex");
+        return ESP_ERR_TIMEOUT;
     }
-    buffer[total] = '\0';
-    return total;
+
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "AT%s\r", command);
+    ESP_LOGI(TAG, "TX: AT%s", command);
+
+    /* esp_modem always needs somewhere to put the reply, even when the caller
+     * passed NULL, so use a scratch buffer in that case.
+     *
+     * NOTE: esp_modem_at_raw() takes no length argument - it writes into the
+     * buffer as a C string. Every caller in this file passes >= 64 bytes and the
+     * replies parsed here (+CSQ, +CREG, +QCCID, +CNUM) are far shorter, but a
+     * command with a long multi-line reply could overrun a small buffer. Use a
+     * local staging buffer sized for the worst case, then copy back bounded. */
+    char  staging[512];
+    char  scratch[256];
+    char *dst = (response && response_size > 0) ? response : scratch;
+
+    staging[0] = '\0';
+    esp_err_t ret = esp_modem_at_raw(s_dce, cmd, staging, "OK", "ERROR", timeout_ms);
+
+    /* Bounded copy back into the caller's buffer. */
+    size_t dst_size = (response && response_size > 0) ? response_size : sizeof(scratch);
+    strncpy(dst, staging, dst_size - 1);
+    dst[dst_size - 1] = '\0';
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "RX: %s", dst);
+    } else {
+        ESP_LOGW(TAG, "AT%s failed (0x%x): %s", command, ret, dst);
+        /* Preserve the old contract: callers check for ESP_OK, and several of
+         * them then strstr() the buffer, so a failed command must not look
+         * like a successful one with stale content. */
+        if (ret != ESP_ERR_TIMEOUT) ret = ESP_ERR_TIMEOUT;
+    }
+
+    xSemaphoreGive(s_uart_mutex);
+    return ret;
 }
 
 static bool gsm_check_at_response(void)
 {
-    char buf[128] = {0};
-    bool result = false;
-
-    bool have_mutex = (s_uart_mutex != NULL);
-    if (have_mutex) {
-        if (xSemaphoreTake(s_uart_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
-            ESP_LOGW(TAG, "Could not acquire mutex for AT check");
-            return false;
-        }
-    }
-
-    uart_flush_input(GSM_UART_NUM);
-    uart_write_bytes(GSM_UART_NUM, "AT\r\n", 4);
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    int len = gsm_read_response(buf, sizeof(buf), 1000);
-    if (len > 0) {
-        ESP_LOGI(TAG, "RX: %s", buf);
-        result = (strstr(buf, "OK") != NULL);
-    }
-
-    if (have_mutex) xSemaphoreGive(s_uart_mutex);
-    return result;
+    if (s_dce == NULL) return false;
+    /* esp_modem_sync() is the "AT" -> "OK" round trip. */
+    return (esp_modem_sync(s_dce) == ESP_OK);
 }
 
 bool gsm_is_alive(void)
 {
     return gsm_check_at_response();
-}
-
-esp_err_t gsm_send_at_command(const char *command, char *response,
-                              size_t response_size, uint32_t timeout_ms)
-{
-    if (!s_initialized) return ESP_ERR_INVALID_STATE;
-    if (command == NULL) return ESP_ERR_INVALID_ARG;
-
-    if (xSemaphoreTake(s_uart_mutex, pdMS_TO_TICKS(10000)) != pdTRUE) {
-        ESP_LOGE(TAG, "Failed to acquire UART mutex");
-        return ESP_ERR_TIMEOUT;
-    }
-
-    uart_flush_input(GSM_UART_NUM);   /* clear stale RX before sending */
-
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "AT%s\r\n", command);
-    ESP_LOGI(TAG, "TX: AT%s", command);
-    uart_write_bytes(GSM_UART_NUM, cmd, strlen(cmd));
-
-    esp_err_t ret = ESP_OK;
-
-    if (response && response_size > 0) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        int len = gsm_read_response(response, response_size, timeout_ms);
-        if (len > 0) {
-            ESP_LOGI(TAG, "RX: %s", response);
-        } else {
-            ESP_LOGW(TAG, "RX: No response");
-            ret = ESP_ERR_TIMEOUT;
-        }
-    }
-
-    xSemaphoreGive(s_uart_mutex);
-    return ret;
 }
 
 esp_err_t gsm_init(void)
@@ -238,7 +976,29 @@ esp_err_t gsm_init(void)
     }
 
     gsm_gpio_init();
-    gsm_uart_init();
+
+    /* esp_netif + the default event loop must exist before esp_modem creates
+     * the PPP interface. Both are idempotent: ESP_ERR_INVALID_STATE just means
+     * another component already did it. */
+    esp_err_t err = esp_netif_init();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_netif_init failed: 0x%x", err);
+        return err;
+    }
+    err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_event_loop_create_default failed: 0x%x", err);
+        return err;
+    }
+
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_GOT_IP,
+                                               &gsm_ip_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_LOST_IP,
+                                               &gsm_ip_event_handler, NULL));
+
+    if (gsm_modem_init() != ESP_OK) {
+        return ESP_FAIL;
+    }
 
     ESP_LOGI(TAG, "Waiting 2s for stabilization...");
     vTaskDelay(pdMS_TO_TICKS(2000));
@@ -256,6 +1016,7 @@ esp_err_t gsm_init(void)
 
     /* Probe-2: try power-on */
     ESP_LOGI(TAG, "Module not responding, trying power-on...");
+    gsm_report_line_state();      /* one summary line, not a break flood */
     gsm_power_on();
 
     for (int i = 0; i < 5; i++) {
@@ -293,7 +1054,7 @@ esp_err_t gsm_init(void)
     ESP_LOGE(TAG, "  If reset doesn't pulse, try flipping NCLE_GSM_RST_INVERTED");
     ESP_LOGE(TAG, "========================================");
 
-    uart_driver_delete(GSM_UART_NUM);
+    gsm_modem_deinit();
     if (s_uart_mutex) {
         vSemaphoreDelete(s_uart_mutex);
         s_uart_mutex = NULL;
@@ -306,7 +1067,7 @@ esp_err_t gsm_deinit(void)
     if (!s_initialized) return ESP_OK;
 
     gsm_power_off();
-    uart_driver_delete(GSM_UART_NUM);
+    gsm_modem_deinit();
     s_initialized = false;
 
     if (s_uart_mutex) {
@@ -442,11 +1203,26 @@ esp_err_t gsm_get_iccid(char *iccid, size_t iccid_size)
 }
 
 /* ============================================================================
- * Data session (PDP context) + HTTP — verification helpers
+ * LEGACY AT-command data path (PDP + QHTTP + QPING)
  * ============================================================================
- * These functions use longer timeouts (PDP activation can take 5-15 seconds)
- * and a multi-stage AT flow (CONNECT prompt + raw data upload).
+ * SUPERSEDED by the PPP path above. Kept, per the Step 1 brief, until PPP is
+ * proven on hardware - but compiled out by default.
+ *
+ * WHY COMPILED OUT AND NOT MERELY UNUSED:
+ * these functions drive the modem with raw uart_write_bytes()/uart_read_bytes()
+ * on GSM_UART_NUM, because the QHTTPURL/QHTTPPOST flow needs a CONNECT prompt
+ * followed by raw payload bytes, which the line-oriented AT API cannot express.
+ * esp_modem now owns that UART. Calling them would put two readers on one RX
+ * FIFO: the HTTP helper would steal PPP frames and PPP would steal the modem's
+ * replies. That corruption is intermittent and would NOT fail the build - which
+ * is exactly the class of fault this port is meant to eliminate.
+ *
+ * To use them, the modem must first be returned to command mode with
+ * gsm_ppp_stop(), and even then they bypass esp_modem's UART ownership.
+ * Enable CONFIG_NCLE_GSM_LEGACY_AT_HTTP only for A/B comparison against the
+ * PPP path, never in a build that also brings PPP up.
  * ===========================================================================*/
+#ifdef CONFIG_NCLE_GSM_LEGACY_AT_HTTP
 
 static bool s_pdp_active = false;
 
@@ -917,5 +1693,50 @@ esp_err_t gsm_ping(const char *host, uint8_t count, uint16_t timeout_s,
 
     return ESP_OK;
 }
+
+#else /* !CONFIG_NCLE_GSM_LEGACY_AT_HTTP */
+
+/* Stubs so callers still link while the legacy AT path is compiled out. They
+ * fail loudly rather than silently corrupting the UART: the PPP path replaces
+ * them (esp_http_client over the netif, and lwIP ping instead of AT+QPING). */
+
+esp_err_t gsm_pdp_activate(void)
+{
+    ESP_LOGE(TAG, "gsm_pdp_activate: legacy AT path disabled - use gsm_ppp_start()");
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t gsm_pdp_deactivate(void)
+{
+    return ESP_OK;    /* nothing to tear down on the legacy path */
+}
+
+esp_err_t gsm_http_get(const char *url, int *http_code_out,
+                       char *resp_body, size_t resp_body_size)
+{
+    (void)url; (void)http_code_out; (void)resp_body; (void)resp_body_size;
+    ESP_LOGE(TAG, "gsm_http_get: legacy AT-HTTP disabled - use esp_http_client over PPP");
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t gsm_http_post(const char *url, const char *body, int *http_code_out,
+                        char *resp_body, size_t resp_body_size)
+{
+    (void)url; (void)body; (void)http_code_out;
+    (void)resp_body; (void)resp_body_size;
+    ESP_LOGE(TAG, "gsm_http_post: legacy AT-HTTP disabled - use esp_http_client over PPP");
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t gsm_ping(const char *host, uint8_t count, uint16_t timeout_s,
+                   gsm_ping_result_t *out)
+{
+    (void)host; (void)count; (void)timeout_s;
+    if (out) memset(out, 0, sizeof(*out));
+    ESP_LOGE(TAG, "gsm_ping: AT+QPING disabled - use the lwIP ping over PPP");
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+#endif /* CONFIG_NCLE_GSM_LEGACY_AT_HTTP */
 
 #endif /* CONFIG_NCLE_GSM_ENABLE */
