@@ -63,6 +63,7 @@
 
 // Include command parser (always needed)
 #include "cmd_parser.h"
+#include "device_config.h"   /* ble_data_mode - gates the live BLE feed */
 
 // Include BLE SPP module if enabled in menuconfig
 #ifdef CONFIG_BLE_SPP_ENABLED
@@ -274,9 +275,37 @@ static volatile bool s_led_activity_flag = false;
  * ============================================================================
  * Weighing Machine → UART → wm_uart.c → this callback → BLE → Mobile App
  */
+/**
+ * @brief Should live meter readings go out over BLE right now?
+ *
+ * BLE_DATA_AUTO (the default) stops the live feed once MQTT is connected: the
+ * server already has every reading, so streaming the same values to the phone
+ * as well just fills the operator's terminal and spends BLE bandwidth. The feed
+ * comes back automatically the moment the cloud link drops, which is when the
+ * app becomes the only way to see what the meters are doing.
+ *
+ * ALWAYS and OFF let the setting be forced either way (ble_data command).
+ */
+static bool ble_readings_enabled(void)
+{
+    switch (config_get_ble_data_mode()) {
+        case BLE_DATA_OFF:    return false;
+        case BLE_DATA_ALWAYS: return true;
+        case BLE_DATA_AUTO:
+        default:
+#ifdef CONFIG_NCLE_MQTT_ENABLE
+            return !mqtt_svc_is_connected();
+#else
+            return true;   /* no cloud in this build -> BLE is the only path */
+#endif
+    }
+}
+
 static void wm_ble_data_callback(const char *json_data, size_t len)
 {
-    ble_spp_output_callback(json_data, (unsigned int)len);
+    if (ble_readings_enabled()) {
+        ble_spp_output_callback(json_data, (unsigned int)len);
+    }
     // The WM weight is merged into the MA message on the MQTT side (see
     // wm_capture); WM does not publish its own cloud reading. wm_capture is fed
     // from the base value callback, not from here, so the merge is unaffected
@@ -399,7 +428,9 @@ static void gsm_ble_status_callback(const gsm_status_t *s, void *ctx)
  */
 static void ma_ble_data_callback(const char *json_data, int len)
 {
-    ble_spp_output_callback(json_data, (unsigned int)len);
+    if (ble_readings_enabled()) {
+        ble_spp_output_callback(json_data, (unsigned int)len);
+    }
 
 #ifdef CONFIG_NCLE_MQTT_ENABLE
     // Hand a COPY of the same JSON to the MQTT queue (non-blocking). Publishing
