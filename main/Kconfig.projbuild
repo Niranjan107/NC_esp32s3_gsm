@@ -70,6 +70,84 @@ menu "NCLite CLEV4"
             help
                 Buffer size for WM hardware UART RX/TX. Only used when
                 NCLE_WM_USE_SOFT_UART is disabled.
+
+        # Weight-capture tuning. These are consumed by
+        # components/application/wm_capture/wm_capture.c, which has #ifndef
+        # fallbacks - so omitting them builds fine but silently locks the values
+        # and makes them untunable. They MUST stay in step with the WiFi product
+        # and the mobile app: see NCLE_WM_REPEAT_MIN below.
+
+        config NCLE_WM_GRACE_MS
+            int "Weight collection grace after the MA reading (ms)"
+            default 200
+            range 0 5000
+            depends on NCLE_WM_ENABLE
+            help
+                How much longer the weight-capture window stays open AFTER the
+                milk analyser's reading is complete, before one weight is
+                selected. Matches the mobile app's 200ms.
+
+                SINGLE-SHOT analysers (1xxx/2xxx/5xxx): the window is already
+                open for seconds while the receipt is transmitted, so several
+                weights are collected and the selection rules (a value repeated
+                >= NCLE_WM_REPEAT_MIN, else nearest the average) do the work.
+                200ms is only there to catch a straggler.
+
+                CONTINUOUS analysers (3xxx/4xxx): the frame ends in ~40ms, so
+                the window collects nothing and the last known weight is used
+                instead. RAISE THIS VALUE to collect real samples in continuous
+                mode - e.g. 2000ms with a scale reporting every ~500ms gives ~4
+                samples, enough for the repeat rule to run. The cost is that the
+                reading is sent that much later.
+
+        config NCLE_WM_GRACE_CONTINUOUS_MS
+            int "Weight collection grace for terminator-framed analysers (ms)"
+            default 2000
+            range 0 10000
+            depends on NCLE_WM_ENABLE
+            help
+                Used instead of NCLE_WM_GRACE_MS when the analyser's frames end
+                on a terminator - PARENTHESES (3xxx) and NEWLINE (4xxx). Those
+                frames complete in about 40ms, so without a longer grace the
+                capture window sees no weights at all and the last known weight
+                has to be used.
+
+                2000ms with a scale reporting every ~500ms collects about 4
+                samples, which is enough for the same repeat rule that
+                single-shot analysers use - so both paths choose the weight the
+                same way, and there is no reliance on the fallback.
+
+                The cost is that the reading reaches the server about 2s later,
+                which is irrelevant at dairy collection speed.
+
+        config NCLE_WM_STALE_MS
+            int "Last-known-weight freshness limit (ms)"
+            default 5000
+            range 1000 60000
+            depends on NCLE_WM_ENABLE
+            help
+                When the capture window collected no weight (normal in
+                continuous mode), the last weight the scale reported is used -
+                but only if it is newer than this. Older than this and the
+                reading is sent with an empty weight instead.
+
+                Guards against attaching a stale weight when the scale has been
+                switched off or unplugged: no weight is safer than a wrong one.
+                Raise it if the scale reports rarely; lower it to be stricter.
+
+        config NCLE_WM_REPEAT_MIN
+            int "Repeats required to accept a weight"
+            default 4
+            range 2 10
+            depends on NCLE_WM_ENABLE
+            help
+                How many times the same value must appear in the collected
+                window before it is accepted as the settled weight. Mirrors the
+                mobile app's rule (4), so the app and the connector choose the
+                SAME weight from the same stream - keep them in step or the two
+                can disagree and cause payment disputes.
+
+                Only used when the window actually collected samples.
     endmenu
 
     menu "MA (Milk Analyzer) UART"
@@ -122,6 +200,26 @@ menu "NCLite CLEV4"
             help
                 Buffer size for MA UART RX/TX.
                 MA data packets can be larger than WM.
+
+        # ma_uart.c tests this with `#if !CONFIG_NCLE_MA_ADAPTIVE_TIMEOUT` -
+        # an #if, not #ifdef. With the symbol undefined that evaluates the bare
+        # identifier as 0, so the fixed-timeout branch is taken by accident
+        # rather than by choice, and the feature is unreachable with no way to
+        # turn it on. Defining it makes the default explicit.
+        config NCLE_MA_ADAPTIVE_TIMEOUT
+            bool "Enable adaptive MA receive timeout"
+            default n
+            depends on NCLE_MA_ENABLE
+            help
+                OFF (default): the MA receive timeout stays fixed at
+                MA_RX_TIMEOUT_MS (3000ms), exactly as it has always behaved.
+
+                ON: the driver measures how long the connected analyser
+                actually pauses mid-frame and lowers the timeout towards
+                MA_RX_TIMEOUT_MIN_MS for the NEXT frame, saving roughly
+                1.5s per reading on a simulator and up to 2.6s on real
+                hardware. Frame line-count is used to detect a frame that
+                was cut short, which restores the full timeout.
     endmenu
 
     menu "Printer UART"

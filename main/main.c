@@ -312,6 +312,37 @@ static void wm_ble_data_callback(const char *json_data, size_t len)
     // if this BLE feed is ever gated off.
 }
 
+#ifdef CONFIG_NCLE_OTA_ENABLE
+/* ============================================================================
+ * Deferred OTA validation - what makes rollback actually work
+ * ============================================================================
+ * After an OTA the bootloader leaves the new image in "pending verify"
+ * (probation): if it does NOT confirm itself and then reboots or crashes, the
+ * bootloader ROLLS BACK to the previous firmware.
+ *
+ * Confirming at boot - which this file used to do - throws that away. A bad
+ * update that crash-loops would be marked valid the instant it started, so the
+ * bootloader would never revert and the device would loop forever. On a GSM
+ * device in the field, with no USB access, that means a site visit.
+ *
+ * So confirm only AFTER the firmware has run for a while without crashing.
+ *
+ * Connectivity is deliberately NOT the test: a good firmware may legitimately
+ * fail to connect (no coverage, expired data pack, broker down) and that must
+ * never trigger a rollback.
+ */
+#define OTA_VALIDATE_DELAY_MS 60000
+static void ota_validate_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(OTA_VALIDATE_DELAY_MS));
+    ota_mark_valid();   /* no-op unless this boot is a pending-verify image */
+    ESP_LOGI(TAG, "OTA: firmware confirmed valid (ran %d s without crashing)",
+             OTA_VALIDATE_DELAY_MS / 1000);
+    vTaskDelete(NULL);
+}
+#endif
+
 /* ============================================================================
  * Base events -> application behaviour
  * ============================================================================
@@ -968,8 +999,10 @@ void app_main(void)
     ESP_LOGI(TAG, "OTA Module: Enabled");
     esp_err_t ota_ret = ota_init();
     if (ota_ret == ESP_OK) {
-        // Mark current firmware as valid (prevents rollback)
-        ota_mark_valid();
+        // Confirm this firmware only after it proves stable (see
+        // ota_validate_task), so a bad update that crash-loops is rolled back
+        // by the bootloader instead of being marked valid the instant it boots.
+        xTaskCreate(ota_validate_task, "ota_valid", 3072, NULL, 1, NULL);
         char part_label[16];
         uint32_t part_addr, part_size;
         ota_get_running_partition_info(part_label, &part_addr, &part_size);
