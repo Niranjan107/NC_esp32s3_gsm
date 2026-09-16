@@ -19,4 +19,5 @@ idf_component_register(
         # Application layer (Step 4/5): MQTT publish + the weight merge.
         mqtt_client_svc
         wm_capture
+        fota
 )

@@ -91,6 +91,9 @@
 #ifdef CONFIG_NCLE_MQTT_ENABLE
 #include "mqtt_client_svc.h"
 #endif
+#if defined(CONFIG_NCLE_OTA_ENABLE) && defined(CONFIG_NCLE_MQTT_ENABLE)
+#include "fota.h"            /* HTTPS-pull update; progress -> BLE + MQTT */
+#endif
 #if defined(CONFIG_NCLE_MA_ENABLE) && defined(CONFIG_NCLE_WM_ENABLE)
 #include "wm_capture.h"
 #endif
@@ -235,6 +238,10 @@ static void run_loopback_test(void)
 
 // LED activity flag - set by WM/MA modules when data is received
 static volatile bool s_led_activity_flag = false;
+
+/* Set while a firmware update is downloading, so the LED can show "busy - do
+ * not power off". Driven from fota_progress_callback. */
+static volatile bool s_led_fota_active = false;
 
 // ============================================================================
 // BLE Data Callback Wrappers
@@ -390,6 +397,28 @@ static void command_output_callback(const char *data, size_t len)
 #endif
     mqtt_svc_publish_resp(data, (int)len);
 }
+
+#ifdef CONFIG_NCLE_OTA_ENABLE
+/**
+ * @brief Carry FOTA progress to every sink, and drive the busy LED.
+ *
+ * fota.c emits {"fota":{"state":"downloading"/"success"/"failed",...}} as it
+ * works. Without this registered the JSON goes nowhere: the server issues
+ * fota_start, receives the initial ack, then hears nothing at all until the
+ * device reboots - on a remote GSM device that is the difference between "the
+ * update is running" and "the device is gone".
+ */
+static void fota_progress_callback(const char *json, int len)
+{
+    if (strstr(json, "\"downloading\"") != NULL) {
+        s_led_fota_active = true;    /* fast blink: busy, do not power off */
+    } else if (strstr(json, "\"success\"") != NULL ||
+               strstr(json, "\"failed\"") != NULL) {
+        s_led_fota_active = false;   /* back to the normal heartbeat */
+    }
+    command_output_callback(json, (size_t)len);
+}
+#endif
 #endif
 
 #ifdef CONFIG_NCLE_GSM_ENABLE
@@ -577,7 +606,25 @@ static void led_task(void *arg)
     ESP_LOGI(TAG, "LED: GPIO%d (active %s)", STATUS_LED_GPIO, LED_ON_LEVEL ? "HIGH" : "LOW");
 
     while (1) {
-        if (s_led_activity_flag) {
+        if (s_led_fota_active) {
+            // Firmware update in progress - continuous fast blink, distinct
+            // from both the idle heartbeat and the 5-blink activity burst.
+            //
+            // WHY: in the field nobody watches a serial console, and a
+            // technician may not have the app open. Without this the device
+            // looks completely idle for the ~90s an update takes, and the
+            // danger is that someone decides it has frozen and pulls the power.
+            // (That is survivable - the running slot is untouched, so it simply
+            // boots the old firmware - but it wastes the update and the trip.)
+            // A visibly "busy" LED says: leave it alone.
+            //
+            // Takes priority over the activity burst: during an update,
+            // "updating" is the more important thing to show.
+            gpio_set_level(STATUS_LED_GPIO, LED_ON_LEVEL);
+            vTaskDelay(pdMS_TO_TICKS(150));
+            gpio_set_level(STATUS_LED_GPIO, LED_OFF_LEVEL);
+            vTaskDelay(pdMS_TO_TICKS(150));
+        } else if (s_led_activity_flag) {
             // Activity detected - clear flag and blink rapidly 5 times
             s_led_activity_flag = false;
 
@@ -885,6 +932,13 @@ void app_main(void)
     // JSON command processor - needed before BLE or console can work
     cmd_parser_init();
     ESP_LOGI(TAG, "Command parser initialized");
+
+#if defined(CONFIG_NCLE_OTA_ENABLE) && defined(CONFIG_NCLE_MQTT_ENABLE)
+    // Registered here, before anything can start an update: fota.c holds this
+    // pointer for the life of the run, and progress emitted before it is set
+    // would simply be dropped.
+    fota_set_output_callback(fota_progress_callback);
+#endif
 
     // Brief delay before hardware initialization
     vTaskDelay(pdMS_TO_TICKS(500));
