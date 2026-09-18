@@ -78,6 +78,7 @@ static mqtt_cmd_cb_t s_cmd_cb = NULL;
 static volatile uint32_t s_published = 0;   /* readings actually sent to broker */
 static volatile uint32_t s_dropped   = 0;   /* readings not sent (offline/queue full) */
 static volatile uint32_t s_deduped   = 0;   /* continuous-meter repeats skipped     */
+static volatile uint32_t s_to_app    = 0;   /* handed to the app over BLE, link down */
 static bool s_buffer_warned = false;        /* "nearly full" warning already sent   */
 
 /* Message buffers / queues.
@@ -282,8 +283,27 @@ static void mqtt_task(void *arg)
              *
              * When not buffering, the else-branch below publishes if the broker
              * is up and drops if it is not - the app already has the reading. */
+            /* Store only while the LINK itself is healthy.
+             *
+             * net_link_is_up() is the whole six-stage GSM chain in one call -
+             * modem, SIM, signal, registration, IP, traffic. If it is up and we
+             * are here, the reading could not be delivered for some other
+             * reason (broker down, certificate, credentials), and it must be
+             * kept until the broker returns.
+             *
+             * If the link is DOWN, ble_data_mode=auto has already opened the
+             * BLE feed and the app is receiving the reading, exactly as the
+             * pre-GSM CLV4 behaved: the connector hands the reading to the app
+             * and the app owns delivery from there. Buffering as well would
+             * have the server receive the same reading twice - once forwarded
+             * by the app, once flushed from flash when the SIM is replaced -
+             * and over a long outage that is the whole ~2500-record buffer.
+             *
+             * KNOWN GAP, accepted deliberately: with the link down and NO phone
+             * listening, the reading is neither sent nor stored. Revisit if
+             * field use shows readings taken with no app connected. */
             if (is_ma && sf_available() && config_get_store_forward() &&
-                net_link_is_provisioned()) {
+                net_link_is_provisioned() && net_link_is_up()) {
                 /* EVERY MA reading goes to flash first - online or not - and is
                  * delivered by the flush loop below, which removes the file only
                  * after the broker's PUBACK.
@@ -334,6 +354,15 @@ static void mqtt_task(void *arg)
                         ESP_LOGW(TAG, "Publish REJECTED by client, dropped reading (dropped=%lu)",
                                  (unsigned long)s_dropped);
                     }
+                } else if (is_ma && !net_link_is_up()) {
+                    /* Link down: the BLE feed is open and the app has this
+                     * reading (see the buffering comment above). Not a loss, so
+                     * it is counted separately and logged calmly - a "dropped"
+                     * warning here would have the operator chasing a fault that
+                     * is really the designed hand-off to the app. */
+                    s_to_app++;
+                    ESP_LOGI(TAG, "Link down - reading handed to the app over BLE (app=%lu)",
+                             (unsigned long)s_to_app);
                 } else {
                     s_dropped++;
                     ESP_LOGW(TAG, "Broker offline, dropped reading (dropped=%lu)",
