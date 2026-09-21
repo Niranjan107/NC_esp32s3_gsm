@@ -831,6 +831,17 @@ static int gsm_link_status_json(char *buf, size_t size)
 
 void gsm_net_link_register(void)
 {
+    /* One-shot. net_link is a 2-slot append-only table with no unregister, and
+     * link_mode calls this every time the operator switches back to gsm - a
+     * second registration would take the slot WiFi needs, and the third would
+     * fail outright. The failure is quiet: the application only asks "is
+     * anything up", so a link missing from the table reads as permanently
+     * offline on a modem that is working fine. */
+    static bool s_registered = false;
+    if (s_registered) {
+        return;
+    }
+
     /* Static storage: net_link keeps the pointer, so a stack copy would
      * dangle. is_provisioned is left NULL - a SIM needs no credentials
      * entered, unlike WiFi, and net_link treats absent as "yes". */
@@ -841,6 +852,7 @@ void gsm_net_link_register(void)
     };
 
     if (net_link_register(&gsm_link)) {
+        s_registered = true;
         ESP_LOGI(TAG, "registered with net_link as '%s'", gsm_link.name);
     } else {
         ESP_LOGE(TAG, "net_link registration FAILED - the application layer "

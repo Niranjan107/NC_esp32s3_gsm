@@ -86,6 +86,12 @@
 #include "gsm_task.h"
 #endif
 
+/* Selects which connectivity stack runs - gsm, wifi, or neither. Included
+ * unconditionally: it compiles down to gsm-or-off when WiFi is not built. */
+#if defined(CONFIG_NCLE_GSM_ENABLE) || defined(CONFIG_NCLE_WIFI_ENABLE)
+#include "link_mode.h"
+#endif
+
 // Application layer: what the device does with the internet. Reaches the
 // network only through net_link, so it is identical to the WiFi product's copy.
 #ifdef CONFIG_NCLE_MQTT_ENABLE
@@ -1106,21 +1112,20 @@ void app_main(void)
         ESP_LOGI(TAG, "GSM -> BLE callback registered");
 
 #ifdef CONFIG_NCLE_GSM_AUTO_START
-        /* Field devices have nobody to send gsm_enable. The task retries with
-         * back-off if the modem is absent or slow to power up, and all of its
-         * work happens on its own task - WM, MA, printer and BLE keep running
-         * normally throughout, including during the ~2 min worst case when
-         * every APN fails.
+        /* Field devices have nobody to send a command, so the selected link
+         * comes up by itself. link_mode_start() reads the operator's stored
+         * choice (gsm by default) and brings up exactly that stack - never
+         * both, because two network stacks in memory at once leaves too little
+         * heap for a firmware update.
          *
-         * A user who sent gsm_disable stays disabled: auto-start must not
-         * silently undo a deliberate choice at the next power cycle. */
-        if (!gsm_is_enabled_pref()) {
-            ESP_LOGI(TAG, "GSM Module: disabled by user - send 'gsm_enable' to turn on");
-        } else if (gsm_task_start() == ESP_OK) {
-            ESP_LOGI(TAG, "GSM Module: auto-start enabled, connecting...");
-        } else {
-            ESP_LOGW(TAG, "GSM Module: auto-start failed to launch task");
-        }
+         * All of the work happens on the connectivity task: WM, MA, printer
+         * and BLE keep running throughout, including during the ~2 min worst
+         * case when every APN fails.
+         *
+         * gsm_enable / gsm_disable still applies within gsm mode, and
+         * link_mode honours it rather than silently undoing a deliberate
+         * choice at the next power cycle. */
+        link_mode_start();
 #else
         ESP_LOGI(TAG, "GSM Module: waiting for 'gsm_enable' command");
 #endif
@@ -1153,6 +1158,12 @@ void app_main(void)
     // Introduce GSM to net_link BEFORE starting MQTT: the MQTT task asks
     // net_link_is_up() as soon as it runs, and a link registered late would
     // read as "permanently offline" until the next poll.
+    //
+    // link_mode_start() above normally does this. This call stays as the
+    // safety net for the path where it does not run at all - BLE failing to
+    // initialise takes the whole block with it, and GSM would then be up but
+    // invisible to MQTT. Registration is one-shot, so calling it twice costs
+    // nothing.
     gsm_net_link_register();
 #endif
 
