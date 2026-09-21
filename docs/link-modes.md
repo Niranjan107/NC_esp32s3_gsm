@@ -159,6 +159,26 @@ All figures from hardware, firmware 2.1.0.1000.
 WiFi reconnects almost four times faster, because there is no modem to power up
 and no APN to negotiate.
 
+### Firmware update headroom
+
+Both links complete a 1.77 MB update, but with very different margins:
+
+| | GSM | WiFi |
+|---|---|---|
+| Free heap before starting | 41.6 KB | 14.5 KB |
+| After MQTT is suspended | 86.8 KB | 59.9 KB |
+| **While downloading** | **38.8 KB** | **7.3 KB** |
+| Time | 422 s | 307 s |
+
+Suspending MQTT is what makes either possible - it frees about 45 KB of TLS
+session. In wifi mode it is the difference between succeeding and not being
+able to open the connection at all.
+
+The 7 KB margin in wifi mode is worth knowing but not worth acting on: a
+device runs on gsm except while its SIM is being replaced, so updates
+normally happen with 38 KB spare. If a future change grows memory use in wifi
+mode, this is the first thing that would break.
+
 ---
 
 ## What does not change with the mode
