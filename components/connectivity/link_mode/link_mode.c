@@ -4,10 +4,14 @@
  */
 #include "link_mode.h"
 #include "device_config.h"
+#include "cmd_parser.h"
+#include "cJSON.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <stdio.h>
+#include <string.h>
 
 #ifdef CONFIG_NCLE_GSM_ENABLE
 #include "gsm.h"
@@ -121,11 +125,89 @@ static esp_err_t tear_down(uint8_t mode)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Commands                                                                  */
+/* ------------------------------------------------------------------------ */
+
+/* The switch blocks for seconds - powering the modem down, waiting for a task
+ * to exit - and it runs on whatever task delivered the command. For BLE that
+ * is the command parser, which must stay responsive: the operator needs to be
+ * able to send another command if this one strands them. So the work happens
+ * on a short-lived task of its own and the reply goes out first. */
+static void link_switch_task(void *arg)
+{
+    uint8_t mode = (uint8_t)(uintptr_t)arg;
+    link_mode_switch(mode);
+    vTaskDelete(NULL);
+}
+
+static void handle_set_link_mode(cJSON *root)
+{
+    cJSON *m = cJSON_GetObjectItem(root, "mode");
+    if (!m || !cJSON_IsString(m) || strlen(m->valuestring) == 0) {
+        send_response("set_link_mode_failed", STATUS_ERR,
+                      "{\"reason\":\"missing_mode\"}");
+        return;
+    }
+
+    uint8_t mode;
+    if (strcmp(m->valuestring, "gsm") == 0) {
+        mode = LINK_MODE_GSM;
+    } else if (strcmp(m->valuestring, "off") == 0) {
+        mode = LINK_MODE_OFF;
+#ifdef CONFIG_NCLE_WIFI_ENABLE
+    } else if (strcmp(m->valuestring, "wifi") == 0) {
+        mode = LINK_MODE_WIFI;
+#endif
+    } else {
+        /* Includes "wifi" on a build without WiFi: the app gets a clear
+         * refusal rather than a mode that silently never arrives. */
+        send_response("set_link_mode_failed", STATUS_ERR,
+                      "{\"reason\":\"unknown_mode\"}");
+        return;
+    }
+
+    if (mode == s_running) {
+        char data[48];
+        snprintf(data, sizeof(data), "{\"mode\":\"%s\",\"state\":\"unchanged\"}",
+                 m->valuestring);
+        send_response("set_link_mode", STATUS_OK, data);
+        return;
+    }
+
+    /* Answer BEFORE switching. Switching away from gsm tears down the link a
+     * cloud-delivered command arrived on, and even over BLE the app should
+     * not wait several seconds for an ack. */
+    char data[48];
+    snprintf(data, sizeof(data), "{\"mode\":\"%s\",\"state\":\"switching\"}",
+             m->valuestring);
+    send_response("set_link_mode", STATUS_OK, data);
+
+    if (xTaskCreate(link_switch_task, "link_switch", 4096,
+                    (void *)(uintptr_t)mode, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "could not start the switch task - staying in %s",
+                 config_link_mode_name(s_running));
+    }
+}
+
+static void handle_get_link_mode(cJSON *root)
+{
+    (void)root;
+    static char data[80];
+    snprintf(data, sizeof(data), "{\"mode\":\"%s\",\"stored\":\"%s\"}",
+             config_link_mode_name(s_running),
+             config_link_mode_name(config_get_link_mode()));
+    send_response("get_link_mode", STATUS_OK, data);
+}
+
+/* ------------------------------------------------------------------------ */
 /* Public                                                                    */
 /* ------------------------------------------------------------------------ */
 
 esp_err_t link_mode_start(void)
 {
+    cmd_parser_register(CMD_SET_LINK_MODE, handle_set_link_mode);
+    cmd_parser_register(CMD_GET_LINK_MODE, handle_get_link_mode);
+
     uint8_t mode = config_get_link_mode();
     ESP_LOGI(TAG, "stored mode: %s", config_link_mode_name(mode));
 

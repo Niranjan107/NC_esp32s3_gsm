@@ -433,7 +433,15 @@ void parse_and_process_commands(char *json_str, int json_len, cmd_source_t sourc
          strcmp(cmd, CMD_SET_BLE_DATA) == 0 ||
          /* set_store_forward turns OFF the never-lose-a-reading guarantee. It
           * is a per-site installation decision, not a remote one. */
-         strcmp(cmd, CMD_SET_STORE_FORWARD) == 0)) {
+         strcmp(cmd, CMD_SET_STORE_FORWARD) == 0 ||
+         /* set_link_mode tears down the link the command arrived on. Sent over
+          * MQTT it would cut its own delivery path, and if the new mode cannot
+          * connect - wrong WiFi password, no router - the device is left
+          * unreachable from the cloud with nobody on site expecting it. The
+          * operator has to be in BLE range to switch, which is exactly where
+          * they need to be to fix it if the switch goes wrong.
+          * get_link_mode stays allowed: reading the mode is harmless. */
+         strcmp(cmd, CMD_SET_LINK_MODE) == 0)) {
         ESP_LOGW(TAG, "Command '%s' blocked over MQTT (BLE/console only)", cmd);
         send_response("command_not_allowed_remotely", STATUS_ERR, NULL);
         cJSON_Delete(root);

@@ -49,6 +49,11 @@ extern "C" {
 #define CMD_WIFI_STATUS         "wifi_status"
 #define CMD_WIFI_ERASE          "wifi_erase"
 
+/* Which connectivity stack runs: gsm (default), wifi, or off. Registered by
+ * the link_mode component, not handled here. */
+#define CMD_SET_LINK_MODE       "set_link_mode"
+#define CMD_GET_LINK_MODE       "get_link_mode"
+
 // Diagnostics (on-demand): connectivity + counters + WM/MA/printer config
 #define CMD_DIAG                "diag"
 

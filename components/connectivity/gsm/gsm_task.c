@@ -552,10 +552,24 @@ static void gsm_task_body(void *arg)
          * is what MQTT and FOTA will need. Both use the standard stack, so
          * success here means the netif is genuinely socket-capable. */
         vTaskDelay(pdMS_TO_TICKS(2000));   /* let the link settle */
-        ping_ok = (gsm_test_ping(NULL, 4) == ESP_OK);
-        gsm_test_http_get(NULL);
+
+        /* Skip the proof-of-life checks if a stop arrived while the link was
+         * coming up. They exist to reassure whoever is watching a normal boot;
+         * spending ~8 s of ping and HTTP on a link that is about to be torn
+         * down just makes the operator's mode switch look hung. */
+        if (s_running) {
+            ping_ok = (gsm_test_ping(NULL, 4) == ESP_OK);
+        }
+        if (s_running) {
+            gsm_test_http_get(NULL);
+        }
     } else {
         ESP_LOGW(TAG, "Data link not available (0x%x)", ppp_err);
+    }
+
+    if (!s_running) {
+        ESP_LOGI(TAG, "stop requested during bring-up - skipping diagnostics");
+        goto task_exit;
     }
 
     /* Print the stage-by-stage summary. On success it confirms every stage; on
@@ -640,9 +654,10 @@ static void gsm_task_body(void *arg)
         }
     }
 
+task_exit:
     ESP_LOGI(TAG, "GSM task stopping");
     gsm_deinit();
-    s_task_handle = NULL;
+    s_task_handle = NULL;       /* published last: gsm_task_stop() waits on it */
     vTaskDelete(NULL);
 }
 
@@ -672,22 +687,31 @@ esp_err_t gsm_task_stop(void)
     /* Wait for the task to actually exit, not just to be told to.
      *
      * It clears the flag, falls out of its loop, and calls gsm_deinit() on the
-     * way out - which powers the modem down and destroys the DCE. The caller
-     * here is link_mode, about to bring WiFi up: starting esp_wifi_init()
-     * while GSM is still holding its PPP netif and ~35 KB of modem state
+     * way out - which leaves data mode, powers the modem down and destroys the
+     * DCE. The caller here is link_mode, about to bring WiFi up: starting
+     * esp_wifi_init() while GSM still holds its PPP netif and modem state
      * would put both stacks in memory at once, which is the one thing the
      * whole design exists to avoid.
      *
-     * The loop polls at 10 s, and gsm_deinit() itself can spend ~3 s powering
-     * the module down, so 15 s is the realistic ceiling rather than a
-     * generous one. */
-    for (int i = 0; i < 150 && s_task_handle; i++) {
+     * 45 s, because the flag is only tested between steps and a stop can
+     * arrive at the worst moment. Measured worst case: a stop issued just as
+     * the task began bringing the link up had to wait out a 6.25 s APN
+     * connect, a 4 s ping, the diagnostic sweep, then ~3 s of PPP teardown and
+     * ~3 s powering the module down - about 15 s of work after the request,
+     * and that was with the APN succeeding first time. An APN trial chain can
+     * add a minute more, which is why failure here does not abandon the task:
+     * it is making progress, just not fast enough for this call. */
+    for (int i = 0; i < 450 && s_task_handle; i++) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
     if (s_task_handle) {
-        ESP_LOGE(TAG, "GSM task did not stop within 15 s - leaving it running");
-        s_running = true;           /* it is still going; do not lie about it */
+        /* Do NOT set s_running back to true. The task has seen the request and
+         * is unwinding; it will exit and call gsm_deinit() on its own. Setting
+         * the flag would tell it to carry on polling, and it would then be
+         * running with link_mode believing the switch failed. */
+        ESP_LOGE(TAG, "GSM task still stopping after 45 s - it will finish on "
+                      "its own, but the mode switch cannot wait for it");
         return ESP_ERR_TIMEOUT;
     }
 
