@@ -49,6 +49,7 @@ static const char *KEY_PRINTER_CONFIG = "printer_cfg";
 static const char *KEY_DEVICE_NAME = "dev_name";
 static const char *KEY_BLE_DATA_MODE = "ble_data";
 static const char *KEY_STORE_FORWARD = "sf_on";
+static const char *KEY_LINK_MODE     = "link_mode";
 
 /**
  * Global device configuration structure
@@ -111,6 +112,7 @@ void config_load_defaults(device_config_t *config)
 
     // Store-and-forward on: never lose a reading to a network outage
     config->store_forward = DEFAULT_STORE_FORWARD;
+    config->link_mode = DEFAULT_LINK_MODE;
 
     ESP_LOGI(TAG, "Default configuration loaded");
 }
@@ -176,6 +178,19 @@ esp_err_t config_load_from_nvs(device_config_t *config)
     err = nvs_get_u8(handle, KEY_STORE_FORWARD, &sf_on);
     config->store_forward = (err == ESP_OK) ? (sf_on != 0) : DEFAULT_STORE_FORWARD;
 
+    // Which connectivity stack to bring up. Absent on any device flashed
+    // before this setting existed -> GSM, so an upgrade keeps behaving as it
+    // did. The range check matters as much as the presence check: a stale
+    // value from a build that had more modes must not select one this build
+    // cannot enter.
+    uint8_t lmode;
+    err = nvs_get_u8(handle, KEY_LINK_MODE, &lmode);
+    if (err == ESP_OK && lmode <= LINK_MODE_OFF) {
+        config->link_mode = lmode;
+    } else {
+        config->link_mode = DEFAULT_LINK_MODE;
+    }
+
     nvs_close(handle);
     ESP_LOGI(TAG, "Configuration loaded from NVS");
     return ESP_OK;
@@ -227,6 +242,7 @@ esp_err_t config_save_to_nvs(const device_config_t *config)
 
     // Save store-and-forward flag
     err = nvs_set_u8(handle, KEY_STORE_FORWARD, config->store_forward ? 1 : 0);
+    err = nvs_set_u8(handle, KEY_LINK_MODE, config->link_mode);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to save store-forward flag");
     }
@@ -301,6 +317,45 @@ const char *config_ble_data_mode_name(uint8_t mode)
         case BLE_DATA_ALWAYS: return "always";
         case BLE_DATA_OFF:    return "off";
         default:              return "unknown";
+    }
+}
+
+/**
+ * @brief Record which connectivity stack should run.
+ *
+ * Only records it. link_mode_switch() is what actually tears one stack down
+ * and brings the other up, and it calls this only after that has succeeded -
+ * so a mode that would not start never becomes what the device boots into.
+ */
+esp_err_t config_set_link_mode(uint8_t mode)
+{
+    if (mode > LINK_MODE_OFF) {
+        return ESP_ERR_INVALID_ARG;
+    }
+#ifndef CONFIG_NCLE_WIFI_ENABLE
+    /* A GSM-only build must refuse wifi rather than store a mode it has no
+     * code to enter - otherwise the device boots, fails to bring anything up,
+     * and falls back every time. */
+    if (mode == LINK_MODE_WIFI) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+#endif
+    g_device_config.link_mode = mode;
+    return config_save_to_nvs(&g_device_config);
+}
+
+uint8_t config_get_link_mode(void)
+{
+    return g_device_config.link_mode;
+}
+
+const char *config_link_mode_name(uint8_t mode)
+{
+    switch (mode) {
+        case LINK_MODE_GSM:  return "gsm";
+        case LINK_MODE_WIFI: return "wifi";
+        case LINK_MODE_OFF:  return "off";
+        default:             return "unknown";
     }
 }
 

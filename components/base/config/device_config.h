@@ -92,6 +92,30 @@ extern "C" {
 // buffer exists to cover.
 #define DEFAULT_STORE_FORWARD       true
 
+// Which connectivity stack is running. Exactly one, ever.
+//
+// This is a memory constraint, not a preference: a spike measured both stacks
+// initialised together leaving 43 KB of heap free, against the ~45 KB FOTA
+// needs to download an image. GSM alone leaves ~124 KB. So the mode does not
+// select a PREFERENCE among running links - it selects which one is brought
+// up at all. The other is never initialised.
+//
+// GSM  - the default. An unconfigured device behaves exactly as before this
+//        setting existed.
+// WIFI - for a site whose SIM has failed but which has a router. GSM is torn
+//        down first; esp_wifi_init() runs only on entering this mode.
+// OFF  - neither radio. Readings go to the app over BLE, which is what the
+//        pre-GSM CLV4 did.
+//
+// Chosen by the operator from the app and stored here, so a machine powered
+// off between the morning and evening collection sessions comes back in the
+// mode it was left in. BLE is unaffected by all three and is always the way
+// back - including out of a wifi mode whose router has been replaced.
+#define LINK_MODE_GSM               0
+#define LINK_MODE_WIFI              1
+#define LINK_MODE_OFF               2
+#define DEFAULT_LINK_MODE           LINK_MODE_GSM
+
 // Device configuration structure
 typedef struct {
     uart_port_config_t ma_config;       // Milk Analyzer config
@@ -100,6 +124,7 @@ typedef struct {
     char device_name[32];               // BLE device name
     uint8_t ble_data_mode;              // BLE_DATA_AUTO / _ALWAYS / _OFF
     bool store_forward;                 // buffer readings to flash (default on)
+    uint8_t link_mode;                  // LINK_MODE_GSM / _WIFI / _OFF
 } device_config_t;
 
 // Global device configuration (extern)
@@ -119,6 +144,13 @@ const char *config_ble_data_mode_name(uint8_t mode);
 // Store-and-forward on/off (off only for permanently app-only sites)
 esp_err_t config_set_store_forward(bool enable);
 bool      config_get_store_forward(void);
+
+// Which connectivity stack runs (LINK_MODE_GSM / _WIFI / _OFF).
+// Setting this only records the choice - link_mode_switch() does the work of
+// tearing one stack down and bringing the other up.
+esp_err_t config_set_link_mode(uint8_t mode);
+uint8_t   config_get_link_mode(void);
+const char *config_link_mode_name(uint8_t mode);
 
 // Individual port configuration
 esp_err_t config_set_ma_port(const uart_port_config_t *config);
