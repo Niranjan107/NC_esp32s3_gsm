@@ -63,6 +63,15 @@ typedef struct {
 esp_err_t ncle_wifi_sta_init(void);
 
 /**
+ * @brief Register WiFi with net_link. Idempotent; call before starting MQTT.
+ *
+ * Separate from init() because init/deinit run repeatedly as the operator
+ * switches link modes, while net_link registration must happen at most once -
+ * the table has 2 slots and no unregister.
+ */
+void wifi_net_link_register(void);
+
+/**
  * @brief Deinitialize WiFi
  * @return ESP_OK on success
  */

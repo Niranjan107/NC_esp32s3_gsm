@@ -398,18 +398,11 @@ esp_err_t ncle_wifi_sta_init(void)
     cmd_parser_register(CMD_WIFI_STATUS, handle_wifi_status);
     cmd_parser_register(CMD_WIFI_ERASE,  handle_wifi_erase);
 
-    /* Announce ourselves to the application layer as a usable network link.
-     * This is the ONLY thing that tells MQTT/FOTA a network exists at all -
-     * they ask net_link_is_up(), never ncle_wifi_sta_is_connected(), so the
-     * same application code runs on the GSM product. Registering once here is
-     * safe: the s_initialized guard above makes init idempotent. */
-    static const net_link_t wifi_link = {
-        .name           = "wifi",
-        .is_up          = ncle_wifi_sta_is_connected,
-        .status_json    = wifi_link_status_json,
-        .is_provisioned = wifi_link_is_provisioned,
-    };
-    net_link_register(&wifi_link);
+    /* net_link registration is NOT done here - see wifi_net_link_register().
+     * On the WiFi product init ran once, so registering from inside it was
+     * safe. Here the operator switches link modes, so init/deinit run
+     * repeatedly, and deinit clears s_initialized - which would let a second
+     * init register a second time into a 2-slot table that has no unregister. */
 
     ESP_LOGI(TAG, "WiFi STA initialized (internal radio, no GPIO needed)");
 
@@ -674,4 +667,39 @@ void ncle_wifi_sta_get_status(wifi_sta_status_t *status)
 bool ncle_wifi_sta_is_connected(void)
 {
     return s_status.connected;
+}
+
+void wifi_net_link_register(void)
+{
+    /* One-shot, and deliberately outside init().
+     *
+     * net_link has NET_LINK_MAX == 2 slots and no unregister - registration is
+     * append-only. GSM takes one slot, WiFi the other. Since the operator can
+     * switch modes any number of times, init() runs repeatedly, and a
+     * registration inside it would consume the last free slot on the second
+     * switch and then fail for good. The failure is quiet in the worst way:
+     * the application only ever asks "is anything up", so a link missing from
+     * the table simply reads as permanently offline.
+     *
+     * Static storage: net_link keeps the pointer, so a stack copy would
+     * dangle. Mirrors gsm_net_link_register(). */
+    static bool s_registered = false;
+    if (s_registered) {
+        return;
+    }
+
+    static const net_link_t wifi_link = {
+        .name           = "wifi",
+        .is_up          = ncle_wifi_sta_is_connected,
+        .status_json    = wifi_link_status_json,
+        .is_provisioned = wifi_link_is_provisioned,
+    };
+
+    if (net_link_register(&wifi_link)) {
+        s_registered = true;
+        ESP_LOGI(TAG, "registered with net_link as '%s'", wifi_link.name);
+    } else {
+        ESP_LOGE(TAG, "net_link registration FAILED - the application layer "
+                      "will believe the device is permanently offline");
+    }
 }
