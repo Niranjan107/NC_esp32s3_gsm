@@ -1154,16 +1154,17 @@ void app_main(void)
 #ifdef CONFIG_NCLE_MQTT_ENABLE
     ESP_LOGI(TAG, "MQTT Module: Enabled");
 
-#ifdef CONFIG_NCLE_GSM_ENABLE
-    // Introduce GSM to net_link BEFORE starting MQTT: the MQTT task asks
-    // net_link_is_up() as soon as it runs, and a link registered late would
-    // read as "permanently offline" until the next poll.
+#if defined(CONFIG_NCLE_GSM_ENABLE) && !defined(CONFIG_BLE_SPP_ENABLED)
+    // Safety net for one specific path: link_mode_start() lives inside the BLE
+    // block, so a build without BLE would never register a link at all and
+    // MQTT would believe the device is permanently offline.
     //
-    // link_mode_start() above normally does this. This call stays as the
-    // safety net for the path where it does not run at all - BLE failing to
-    // initialise takes the whole block with it, and GSM would then be up but
-    // invisible to MQTT. Registration is one-shot, so calling it twice costs
-    // nothing.
+    // Guarded on BLE being absent, not called unconditionally. An earlier
+    // version ran this every boot on the reasoning that one-shot registration
+    // makes a second call free - which is true only when GSM is the running
+    // link. In wifi mode it put GSM in the table alongside WiFi: both links
+    // registered, only one running, and net_link_active() free to name the
+    // wrong one. net_link has 2 slots, so it also left none spare.
     gsm_net_link_register();
 #endif
 
