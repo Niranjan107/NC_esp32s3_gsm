@@ -668,6 +668,30 @@ esp_err_t gsm_task_stop(void)
 {
     if (!s_running) return ESP_OK;
     s_running = false;
+
+    /* Wait for the task to actually exit, not just to be told to.
+     *
+     * It clears the flag, falls out of its loop, and calls gsm_deinit() on the
+     * way out - which powers the modem down and destroys the DCE. The caller
+     * here is link_mode, about to bring WiFi up: starting esp_wifi_init()
+     * while GSM is still holding its PPP netif and ~35 KB of modem state
+     * would put both stacks in memory at once, which is the one thing the
+     * whole design exists to avoid.
+     *
+     * The loop polls at 10 s, and gsm_deinit() itself can spend ~3 s powering
+     * the module down, so 15 s is the realistic ceiling rather than a
+     * generous one. */
+    for (int i = 0; i < 150 && s_task_handle; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    if (s_task_handle) {
+        ESP_LOGE(TAG, "GSM task did not stop within 15 s - leaving it running");
+        s_running = true;           /* it is still going; do not lie about it */
+        return ESP_ERR_TIMEOUT;
+    }
+
+    ESP_LOGI(TAG, "GSM task stopped");
     return ESP_OK;
 }
 

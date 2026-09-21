@@ -1518,6 +1518,22 @@ esp_err_t gsm_deinit(void)
 {
     if (!s_initialized) return ESP_OK;
 
+    /* Leave data mode BEFORE anything else touches the modem.
+     *
+     * gsm_modem_deinit() below calls esp_modem_destroy(), and destroying the
+     * DCE while its worker is still parsing PPP frames is the documented
+     * crash on this board - an InstructionFetchError, seen during failure
+     * testing when a teardown ran mid-session. gsm_ppp_stop() does the
+     * ordering that avoids it: netif down, settle, then back to command mode.
+     *
+     * This costs nothing when PPP is not up (it returns INVALID_STATE on a
+     * null DCE) and it matters most in the case that is about to become
+     * routine: the operator switching to wifi while the GSM link is live. */
+    if (gsm_pdp_is_active()) {
+        ESP_LOGI(TAG, "deinit: leaving data mode before teardown");
+        gsm_ppp_stop();
+    }
+
     gsm_power_off();
     gsm_modem_deinit();
     s_initialized = false;
