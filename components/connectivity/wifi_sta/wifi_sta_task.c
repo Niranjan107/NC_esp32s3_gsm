@@ -25,6 +25,17 @@ static char s_prov_ssid[WIFI_STA_SSID_MAX + 1];
 static char s_prov_pass[WIFI_STA_PASSWORD_MAX + 1];
 static volatile bool s_prov_request = false;
 
+/* Cooperative stop, for switching link modes.
+ *
+ * vTaskDelete() on this task is not safe: it can be blocked inside
+ * ncle_wifi_sta_connect() holding s_status_mutex, and killing it there leaks
+ * the mutex permanently - after which every ncle_wifi_sta_get_status() blocks
+ * forever on portMAX_DELAY, including the one net_link calls to answer "is
+ * the link up". A wedged status read is worse than a slow shutdown, so the
+ * task checks this flag once a second and leaves its own loop instead. */
+static volatile bool s_stop_request = false;
+static volatile bool s_task_exited  = false;
+
 void ncle_wifi_sta_provision(const char *ssid, const char *password)
 {
     if (!ssid) {
@@ -99,7 +110,7 @@ static void wifi_sta_task(void *pvParameters)
     char trial_ssid[WIFI_STA_SSID_MAX + 1] = {0};
     char trial_pass[WIFI_STA_PASSWORD_MAX + 1] = {0};
 
-    while (1) {
+    while (!s_stop_request) {
         wifi_sta_status_t status;
         ncle_wifi_sta_get_status(&status);
 
@@ -177,6 +188,9 @@ static void wifi_sta_task(void *pvParameters)
              * trying forever. Reload creds from NVS each burst so credentials
              * provisioned over BLE (saved by cmd_parser) are picked up. */
             if (++disconnected_secs >= WIFI_RECONNECT_PERIOD_S) {
+                if (s_stop_request) {
+                    break;      /* leaving anyway; do not start another join */
+                }
                 disconnected_secs = 0;
                 char r_ssid[WIFI_STA_SSID_MAX + 1] = {0};
                 char r_pass[WIFI_STA_PASSWORD_MAX + 1] = {0};
@@ -202,6 +216,14 @@ static void wifi_sta_task(void *pvParameters)
         prev_state = status.state;
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
+
+    /* Asked to stop (link mode switching away from wifi). Self-delete is the
+     * only safe delete for this task - see s_stop_request. Publish the exit
+     * flag before deleting so the stopper stops waiting. */
+    ESP_LOGI(TAG, "WiFi task stopping on request");
+    s_task_handle = NULL;
+    s_task_exited = true;
+    vTaskDelete(NULL);
 }
 
 esp_err_t ncle_wifi_sta_task_start(void)
@@ -209,6 +231,10 @@ esp_err_t ncle_wifi_sta_task_start(void)
     if (s_task_handle != NULL) {
         return ESP_OK;
     }
+    /* Clear a previous stop before creating: the task would otherwise see a
+     * stale request and exit on its first loop iteration. */
+    s_stop_request = false;
+    s_task_exited  = false;
     if (xTaskCreate(wifi_sta_task, "wifi_sta", 6144, NULL, 5, &s_task_handle) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create WiFi STA task");
         return ESP_FAIL;
@@ -218,10 +244,27 @@ esp_err_t ncle_wifi_sta_task_start(void)
 
 esp_err_t ncle_wifi_sta_task_stop(void)
 {
-    if (s_task_handle) {
-        vTaskDelete(s_task_handle);
-        s_task_handle = NULL;
-        ncle_wifi_sta_deinit();
+    if (s_task_handle == NULL) {
+        return ESP_OK;                  /* not running */
     }
-    return ESP_OK;
+
+    s_stop_request = true;
+    s_task_exited  = false;
+
+    /* The task checks the flag once a second, so 3 s is generous. If it has
+     * not exited by then something is wedged, and de-initialising WiFi out
+     * from under a live task would be worse than leaving it running - report
+     * the failure and let the caller keep the current mode. */
+    for (int i = 0; i < 30 && !s_task_exited; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    s_stop_request = false;
+
+    if (!s_task_exited) {
+        ESP_LOGE(TAG, "WiFi task did not stop within 3 s - leaving it running");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    return ncle_wifi_sta_deinit();
 }
