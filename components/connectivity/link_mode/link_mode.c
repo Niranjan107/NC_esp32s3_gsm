@@ -208,6 +208,14 @@ esp_err_t link_mode_start(void)
     cmd_parser_register(CMD_SET_LINK_MODE, handle_set_link_mode);
     cmd_parser_register(CMD_GET_LINK_MODE, handle_get_link_mode);
 
+#ifdef CONFIG_NCLE_WIFI_ENABLE
+    /* Register the WiFi commands in EVERY mode, not just wifi mode. The
+     * operator has to be able to enter an SSID while the device is still on
+     * gsm - otherwise switching to wifi could never work the first time, and
+     * there would be no way out of a site whose SIM has failed. */
+    wifi_commands_register();
+#endif
+
     uint8_t mode = config_get_link_mode();
     ESP_LOGI(TAG, "stored mode: %s", config_link_mode_name(mode));
 

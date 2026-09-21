@@ -63,6 +63,17 @@ typedef struct {
 esp_err_t ncle_wifi_sta_init(void);
 
 /**
+ * @brief Register wifi_config / wifi_status / wifi_erase. Call at boot.
+ *
+ * Deliberately independent of whether WiFi is running: the operator needs to
+ * enter credentials while the device is still in gsm mode, or switching to
+ * wifi could never succeed the first time. The handlers cope with the stack
+ * being down - wifi_config stores without testing, wifi_status reports
+ * whether credentials exist.
+ */
+void wifi_commands_register(void);
+
+/**
  * @brief Register WiFi with net_link. Idempotent; call before starting MQTT.
  *
  * Separate from init() because init/deinit run repeatedly as the operator

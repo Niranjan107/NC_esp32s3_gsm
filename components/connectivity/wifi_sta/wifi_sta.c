@@ -193,19 +193,61 @@ static void handle_wifi_config(cJSON *root)
     if (!ssid || !cJSON_IsString(ssid) || strlen(ssid->valuestring) == 0) {
         send_response("config_update_failed", STATUS_ERR,
                       "{\"target\":\"wifi\",\"reason\":\"missing_ssid\"}");
-    } else {
-        const char *pw = (pass && cJSON_IsString(pass)) ? pass->valuestring : "";
-        // Test-before-save: try the credentials first; they are saved to
-        // NVS only if the connection succeeds, otherwise the device
-        // reverts to the previously saved ones.
-        ncle_wifi_sta_provision(ssid->valuestring, pw);
-        send_response("wifi_config", STATUS_OK, "{\"state\":\"connecting\"}");
+        return;
     }
+
+    const char *pw = (pass && cJSON_IsString(pass)) ? pass->valuestring : "";
+
+    if (!s_initialized) {
+        /* WiFi is not running - the device is in gsm or off mode. Store the
+         * credentials unverified so the operator can enter them BEFORE
+         * switching. Without this the device deadlocks: no credentials until
+         * WiFi runs, and WiFi cannot usefully run without credentials.
+         *
+         * "saved" rather than "connecting" in the reply, because nothing has
+         * been tested - they are proven or rejected on the switch to wifi
+         * mode, and wifi_status reports the outcome. */
+        esp_err_t err = ncle_wifi_sta_config_save(ssid->valuestring, pw);
+        if (err != ESP_OK) {
+            send_response("config_update_failed", STATUS_ERR,
+                          "{\"target\":\"wifi\",\"reason\":\"nvs_write_failed\"}");
+            return;
+        }
+        wifi_link_provisioned_changed();
+        ESP_LOGI(TAG, "credentials stored for SSID '%s' (WiFi not running - "
+                      "untested until the mode is switched)", ssid->valuestring);
+        send_response("wifi_config", STATUS_OK, "{\"state\":\"saved\"}");
+        return;
+    }
+
+    // Test-before-save: try the credentials first; they are saved to
+    // NVS only if the connection succeeds, otherwise the device
+    // reverts to the previously saved ones.
+    ncle_wifi_sta_provision(ssid->valuestring, pw);
+    send_response("wifi_config", STATUS_OK, "{\"state\":\"connecting\"}");
 }
 
 static void handle_wifi_status(cJSON *root)
 {
     (void)root;
+
+    if (!s_initialized) {
+        /* Not running - gsm or off mode. Report whether credentials are
+         * stored, because that is the one thing the operator needs to know
+         * before switching. Reading s_status here would be worse than useless:
+         * it is zeroed, so it would claim connected:false on a network that
+         * has never been tried. */
+        char ssid[WIFI_STA_SSID_MAX + 1] = {0};
+        char pw[WIFI_STA_PASSWORD_MAX + 1] = {0};
+        bool have = (ncle_wifi_sta_config_load(ssid, pw) == ESP_OK && ssid[0]);
+        static char idle_data[96];
+        snprintf(idle_data, sizeof(idle_data),
+                 "{\"running\":false,\"provisioned\":%s,\"ssid\":\"%s\"}",
+                 have ? "true" : "false", have ? ssid : "");
+        send_response("wifi_status", STATUS_OK, idle_data);
+        return;
+    }
+
     wifi_sta_status_t st;
     ncle_wifi_sta_get_status(&st);
     // "cloud" = broker reachable = the REAL "internet actually works" signal.
@@ -402,14 +444,12 @@ esp_err_t ncle_wifi_sta_init(void)
 
     s_initialized = true;
 
-    /* Own our three commands instead of leaving them in the shared parser.
-     * Registered here, not in cmd_parser, so that base file stays identical in
-     * every CLV4 product - the GSM component registers apn_config/sim_status the
-     * same way. Registration is after s_initialized so a handler can never run
-     * against a half-initialised driver. */
-    cmd_parser_register(CMD_WIFI_CONFIG, handle_wifi_config);
-    cmd_parser_register(CMD_WIFI_STATUS, handle_wifi_status);
-    cmd_parser_register(CMD_WIFI_ERASE,  handle_wifi_erase);
+    /* Commands are NOT registered here - see wifi_commands_register(), called
+     * at boot regardless of mode. On the WiFi product registering from inside
+     * init was right, because init always ran. Here it would deadlock: the
+     * operator cannot enter credentials without wifi_config, wifi_config does
+     * not exist until WiFi initialises, and WiFi will not stay up without
+     * credentials. */
 
     /* net_link registration is NOT done here - see wifi_net_link_register().
      * On the WiFi product init ran once, so registering from inside it was
@@ -680,6 +720,27 @@ void ncle_wifi_sta_get_status(wifi_sta_status_t *status)
 bool ncle_wifi_sta_is_connected(void)
 {
     return s_status.connected;
+}
+
+void wifi_commands_register(void)
+{
+    /* Called at boot in EVERY mode, so the operator can enter credentials
+     * while the device is still on gsm and then switch to a WiFi that works
+     * first time. The handlers check s_initialized and behave sensibly when
+     * the stack is down: wifi_config stores without testing, wifi_status
+     * reports whether credentials exist rather than reading a zeroed struct.
+     *
+     * Idempotent because cmd_parser_register refuses duplicates, but the
+     * guard keeps the log clean across mode switches. */
+    static bool s_cmds_registered = false;
+    if (s_cmds_registered) {
+        return;
+    }
+    s_cmds_registered = true;
+
+    cmd_parser_register(CMD_WIFI_CONFIG, handle_wifi_config);
+    cmd_parser_register(CMD_WIFI_STATUS, handle_wifi_status);
+    cmd_parser_register(CMD_WIFI_ERASE,  handle_wifi_erase);
 }
 
 void wifi_net_link_register(void)
