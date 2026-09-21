@@ -378,7 +378,20 @@ esp_err_t ncle_wifi_sta_init(void)
      * With the default BALANCE, BLE activity starves the WPA2 4-way
      * handshake and connection is slow/unreliable when a phone is
      * connected. Preferring WiFi makes connection fast and stable; BLE
-     * config commands (tiny, infrequent) still get through. */
+     * config commands (tiny, infrequent) still get through.
+     *
+     * Kept as PREFER_WIFI on the GSM product too, though BLE matters more
+     * here - it is the primary control channel AND the only way to switch a
+     * device back to gsm when its router has been replaced. Two reasons not
+     * to soften it: the comment above records a measured failure with
+     * BALANCE, not a theoretical one; and this line only ever runs while WiFi
+     * is initialised, which on this product means only in wifi mode. In gsm
+     * and off modes esp_wifi_init() is never called, so the preference is
+     * never set and BLE has the radio to itself.
+     *
+     * The risk that remains is BLE responsiveness while in wifi mode. If an
+     * operator cannot reach a wifi-mode device over BLE to switch it back,
+     * revisit this - and measure, rather than assuming BALANCE is better. */
 #if CONFIG_ESP_COEX_SW_COEXIST_ENABLE
     esp_err_t coex_ret = esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
     ESP_LOGI(TAG, "Coexistence preference: WiFi (%s)", esp_err_to_name(coex_ret));

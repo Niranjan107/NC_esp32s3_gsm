@@ -40,7 +40,7 @@ Recorded here because the plan argues from them and there is no separate spec.
 - `net_link_register()` is called from inside `ncle_wifi_sta_init()` (`wifi_sta.c:412`). `NET_LINK_MAX` is 2 and `net_link.c` has no unregister. Re-initialising WiFi twice would exhaust the table. → Task 3.
 - The task's reconnect loop (`wifi_sta_task.c:179-195`) retries every 15 s forever with no off switch, so "switch to GSM" would leave WiFi associating in the background. → Task 5.
 - `ncle_wifi_sta_task_stop()` uses `vTaskDelete()` on a task that may hold `s_status_mutex`, permanently leaking it. → Task 5.
-- `esp_coex_preference_set(ESP_COEX_PREFER_WIFI)` (`wifi_sta.c:382`) biases the shared 2.4 GHz radio away from BLE unconditionally. In this product BLE is the primary control channel. → Task 4.
+- `esp_coex_preference_set(ESP_COEX_PREFER_WIFI)` (`wifi_sta.c:382`) biases the shared 2.4 GHz radio away from BLE. In this product BLE is the primary control channel. → Task 4. **Revised during implementation:** the setting was kept. The code comment records a *measured* failure with BALANCE - BLE starving the WPA2 handshake - and the line only runs while WiFi is initialised, which the lazy-init design already confines to wifi mode. Changing it would have traded a known problem for an assumed one. The residual risk (BLE responsiveness in wifi mode) is checked in Task 8 step 6.
 
 ---
 
