@@ -97,3 +97,13 @@ CONFIG_NCLE_WM_GRACE_CONTINUOUS_MS=2000
 CONFIG_NCLE_WM_STALE_MS=5000
 CONFIG_NCLE_WM_REPEAT_MIN=4
 # CONFIG_NCLE_MA_ADAPTIVE_TIMEOUT is not set
+
+# WiFi as a selectable alternative link (see docs/superpowers/plans/
+# 2026-09-21-wifi-as-alternative-link.md). Compiled in, but NOT started at
+# boot: a spike measured esp_wifi_init() costing 81 KB of heap (124 KB -> 43 KB
+# free) whether or not the radio ever associates, and FOTA needs ~45 KB to
+# download an image. Bring-up is deferred to the link_mode component.
+#
+# Set to n for a GSM-only build: that restores the pre-WiFi firmware exactly -
+# ~1466 KB, ~124 KB free heap, no esp_wifi symbols linked.
+CONFIG_NCLE_WIFI_ENABLE=y
