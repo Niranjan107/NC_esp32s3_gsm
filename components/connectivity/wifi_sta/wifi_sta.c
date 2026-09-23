@@ -767,6 +767,9 @@ void wifi_net_link_register(void)
         .is_up          = ncle_wifi_sta_is_connected,
         .status_json    = wifi_link_status_json,
         .is_provisioned = wifi_link_is_provisioned,
+        /* Switched on = the task exists. False once link_mode tears WiFi down,
+         * even though the descriptor stays registered for good. */
+        .is_enabled     = ncle_wifi_sta_task_is_running,
     };
 
     if (net_link_register(&wifi_link)) {

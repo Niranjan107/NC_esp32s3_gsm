@@ -308,19 +308,21 @@ static void mqtt_task(void *arg)
              * arise either: nothing went over BLE, so nothing can be forwarded.
              * (Same rule as the WiFi product - see its copy of this file.)
              *
-             * ...unless no link is registered at all, which on this product is
+             * ...unless every link is switched OFF, which on this product is
              * link_mode=off: no internet, ever. Buffering there would fill the
              * store with readings nothing on this device will ever deliver,
-             * then evict in a loop. Asked through net_link rather than
-             * link_mode so this file stays identical to the WiFi product's
-             * copy - the application layer must not know which connectivity
-             * components exist.
+             * then evict in a loop. Asked through net_link_any_enabled() rather
+             * than link_mode, so the application layer never learns which
+             * connectivity components exist. (An earlier version asked whether
+             * any link was REGISTERED - wrong, because registration is
+             * permanent: a device that booted in gsm and was switched to off
+             * still has GSM in the table. Hardware test caught it.)
              *
              * KNOWN GAP, accepted deliberately: link down, BLE feed open, and
              * NO phone listening - the reading is neither sent nor stored.
              * Revisit if field use shows readings taken with no app connected. */
             bool ble_gets_it = (config_get_ble_data_mode() != BLE_DATA_MODE_OFF);
-            bool have_a_link = (strcmp(net_link_active(), "unconfigured") != 0);
+            bool have_a_link = net_link_any_enabled();
             bool want_buffer = ble_gets_it
                              ? (net_link_is_provisioned() && net_link_is_up())
                              : have_a_link;

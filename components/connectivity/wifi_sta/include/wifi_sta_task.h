@@ -37,6 +37,9 @@ void ncle_wifi_sta_task_set_status_callback(wifi_status_cb_t cb);
 void ncle_wifi_sta_provision(const char *ssid, const char *password);
 
 /** Start the WiFi STA task (inits WiFi, auto-connects from NVS/dev creds). */
+/** True while the WiFi task exists - i.e. WiFi is switched on (net_link is_enabled). */
+bool ncle_wifi_sta_task_is_running(void);
+
 esp_err_t ncle_wifi_sta_task_start(void);
 
 /** Stop the WiFi STA task and deinit WiFi. */

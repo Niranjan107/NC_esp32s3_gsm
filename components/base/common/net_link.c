@@ -74,6 +74,16 @@ bool net_link_is_provisioned(void)
     return false;
 }
 
+bool net_link_any_enabled(void)
+{
+    for (int i = 0; i < s_count; i++) {
+        if (!s_links[i]->is_enabled || s_links[i]->is_enabled()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 const char *net_link_active(void)
 {
     if (s_count == 0) {

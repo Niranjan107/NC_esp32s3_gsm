@@ -226,6 +226,11 @@ static void wifi_sta_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
+bool ncle_wifi_sta_task_is_running(void)
+{
+    return s_task_handle != NULL;
+}
+
 esp_err_t ncle_wifi_sta_task_start(void)
 {
     if (s_task_handle != NULL) {

@@ -845,10 +845,15 @@ void gsm_net_link_register(void)
     /* Static storage: net_link keeps the pointer, so a stack copy would
      * dangle. is_provisioned is left NULL - a SIM needs no credentials
      * entered, unlike WiFi, and net_link treats absent as "yes". */
+    /* is_enabled: the task is running. False after link_mode switches away
+     * from gsm, or when the user sent gsm_disable - in both cases nothing will
+     * ever deliver a buffered reading, so the application layer must not
+     * store one. Registration alone cannot say this: it is permanent. */
     static const net_link_t gsm_link = {
         .name        = "gsm",
         .is_up       = gsm_link_is_up,
         .status_json = gsm_link_status_json,
+        .is_enabled  = gsm_task_is_running,
     };
 
     if (net_link_register(&gsm_link)) {
