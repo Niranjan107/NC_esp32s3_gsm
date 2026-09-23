@@ -26,6 +26,8 @@
  * including device_config.h, which pulls in the UART port types this layer has
  * no business knowing about. */
 bool config_get_store_forward(void);
+uint8_t config_get_ble_data_mode(void);
+#define BLE_DATA_MODE_OFF 2   /* mirrors BLE_DATA_OFF in device_config.h */
 
 /* From the `common` component (MAC-based device id). Forward-declared rather
  * than including common.h, whose include guard collides with a header pulled
@@ -283,7 +285,7 @@ static void mqtt_task(void *arg)
              *
              * When not buffering, the else-branch below publishes if the broker
              * is up and drops if it is not - the app already has the reading. */
-            /* Store only while the LINK itself is healthy.
+            /* Store only while the reading has somewhere else to go.
              *
              * net_link_is_up() is the whole six-stage GSM chain in one call -
              * modem, SIM, signal, registration, IP, traffic. If it is up and we
@@ -291,19 +293,40 @@ static void mqtt_task(void *arg)
              * reason (broker down, certificate, credentials), and it must be
              * kept until the broker returns.
              *
-             * If the link is DOWN, ble_data_mode=auto has already opened the
-             * BLE feed and the app is receiving the reading, exactly as the
-             * pre-GSM CLV4 behaved: the connector hands the reading to the app
-             * and the app owns delivery from there. Buffering as well would
-             * have the server receive the same reading twice - once forwarded
-             * by the app, once flushed from flash when the SIM is replaced -
-             * and over a long outage that is the whole ~2500-record buffer.
+             * If the link is DOWN, the BLE feed is open and the app is
+             * receiving the reading, exactly as the pre-GSM CLV4 behaved: the
+             * connector hands it over and the app owns delivery from there.
+             * Buffering as well would have the server receive the same reading
+             * twice - once forwarded by the app, once flushed from flash when
+             * the SIM is replaced - and over a long outage that is the whole
+             * ~2500-record buffer.
              *
-             * KNOWN GAP, accepted deliberately: with the link down and NO phone
-             * listening, the reading is neither sent nor stored. Revisit if
-             * field use shows readings taken with no app connected. */
+             * EXCEPTION - ble_data "off": the app never receives readings, so
+             * skipping the buffer would leave a reading taken with the link
+             * down visible NOWHERE. In "off" the flash is the only copy, so it
+             * is buffered whether the link is up or not. No duplicate can
+             * arise either: nothing went over BLE, so nothing can be forwarded.
+             * (Same rule as the WiFi product - see its copy of this file.)
+             *
+             * ...unless no link is registered at all, which on this product is
+             * link_mode=off: no internet, ever. Buffering there would fill the
+             * store with readings nothing on this device will ever deliver,
+             * then evict in a loop. Asked through net_link rather than
+             * link_mode so this file stays identical to the WiFi product's
+             * copy - the application layer must not know which connectivity
+             * components exist.
+             *
+             * KNOWN GAP, accepted deliberately: link down, BLE feed open, and
+             * NO phone listening - the reading is neither sent nor stored.
+             * Revisit if field use shows readings taken with no app connected. */
+            bool ble_gets_it = (config_get_ble_data_mode() != BLE_DATA_MODE_OFF);
+            bool have_a_link = (strcmp(net_link_active(), "unconfigured") != 0);
+            bool want_buffer = ble_gets_it
+                             ? (net_link_is_provisioned() && net_link_is_up())
+                             : have_a_link;
+
             if (is_ma && sf_available() && config_get_store_forward() &&
-                net_link_is_provisioned() && net_link_is_up()) {
+                want_buffer) {
                 /* EVERY MA reading goes to flash first - online or not - and is
                  * delivered by the flush loop below, which removes the file only
                  * after the broker's PUBACK.
@@ -354,12 +377,16 @@ static void mqtt_task(void *arg)
                         ESP_LOGW(TAG, "Publish REJECTED by client, dropped reading (dropped=%lu)",
                                  (unsigned long)s_dropped);
                     }
-                } else if (is_ma && !net_link_is_up()) {
-                    /* Link down: the BLE feed is open and the app has this
+                } else if (is_ma && !net_link_is_up() && ble_gets_it) {
+                    /* Link down with the BLE feed open: the app has this
                      * reading (see the buffering comment above). Not a loss, so
                      * it is counted separately and logged calmly - a "dropped"
                      * warning here would have the operator chasing a fault that
-                     * is really the designed hand-off to the app. */
+                     * is really the designed hand-off to the app.
+                     *
+                     * ble_data "off" is excluded deliberately: with BLE
+                     * silent nothing received the reading, and the else below
+                     * is right to call that a drop rather than a hand-off. */
                     s_to_app++;
                     ESP_LOGI(TAG, "Link down - reading handed to the app over BLE (app=%lu)",
                              (unsigned long)s_to_app);
