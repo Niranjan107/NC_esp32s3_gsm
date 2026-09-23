@@ -191,6 +191,56 @@ asks only "can I send?" and never learns which radio answered.
 *not* buffered — the app owns delivery from there. That applies in off mode and
 during any outage, on either link.
 
+The one exception is `ble_data=off`: nothing goes to the phone, so with the
+link down the reading is stored anyway and sent when the link returns. In
+`link_mode=off` nothing is ever stored, whatever `ble_data` says.
+
+### Where readings go — full table
+
+**`set_link_mode`** decides which radio runs:
+
+| link_mode | GSM | WiFi | BLE | Internet |
+|---|---|---|---|---|
+| `gsm` *(default)* | on | off | on | via SIM |
+| `wifi` | off | on | on | via router |
+| `off` | off | off | on | none |
+
+**`set_ble_data`** in `gsm` or `wifi` mode:
+
+| ble_data | Internet + broker up | Internet up, broker down | Internet down |
+|---|---|---|---|
+| `auto` *(default)* | BLE ⛔ · Flash ✅ | BLE ✅ · Flash ✅ | BLE ✅ · Flash ⛔ |
+| `always` | BLE ✅ · Flash ✅ | BLE ✅ · Flash ✅ | BLE ✅ · Flash ⛔ |
+| `app` | BLE ✅ · Flash ⛔ | BLE ✅ · Flash ⛔ | BLE ✅ · Flash ⛔ |
+| `off` | BLE ⛔ · Flash ✅ | BLE ⛔ · Flash ✅ | BLE ⛔ · Flash ✅ |
+
+**`set_ble_data`** in `link_mode=off`:
+
+| ble_data | BLE | Flash |
+|---|---|---|
+| `auto` / `always` / `app` | ✅ | ⛔ |
+| `off` | ⛔ | ⛔ |
+
+The rules behind it:
+
+- **Flash** follows the internet: up → stored, deleted on the broker's
+  acknowledgement; down → not stored, the app owns delivery.
+- **Exception:** with `ble_data=off` nothing goes to the phone, so the reading
+  is stored even with the internet down — flash is its only copy.
+- **`link_mode=off`** never stores: no internet, ever, so nothing could deliver it.
+- `app` turns storage off permanently by changing `store_forward`.
+- `link_mode=off` + `ble_data=off` gives the board no delivery path at all — not
+  a configuration to deploy.
+
+| Site | link_mode | ble_data |
+|---|---|---|
+| Normal, has a SIM | `gsm` | `auto` |
+| SIM failed, has WiFi | `wifi` | `auto` |
+| Operator needs live readings on the phone | `gsm` | `always` |
+| Server only, no phone access | `gsm` | `off` |
+| No network ever, phone is the only path | `off` | `auto` |
+
+
 **BLE.** Unaffected in all three modes.
 
 ---

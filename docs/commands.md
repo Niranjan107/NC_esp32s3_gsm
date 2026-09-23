@@ -8,7 +8,7 @@ dispatch chain in `cmd_parser.c` and the component registrations in
 or `\n` also works.
 
 **Reply:** `{"response_message":"<name>","status_code":<n>,"data":<json>}`
-where `status_code` is `0` for success and `1` for failure. Some commands
+where `status_code` is `0` for success and `-1` for failure. Some commands
 reply without `data`; two (`diag`, `self_diagnosis`) emit a raw JSON object
 instead of a wrapped response.
 
@@ -126,7 +126,7 @@ Two independent rules.
 | Link | Stored? |
 |---|---|
 | Up | yes, deleted on the broker's acknowledgement |
-| Down | no — BLE carries it, the app owns delivery |
+| Down | no — BLE carries it, the app owns delivery *(except `ble_data=off`: stored)* |
 
 A reading is stored whether or not the broker is reachable. That is the point:
 it survives a broker outage and is sent when the broker returns.
@@ -149,8 +149,54 @@ would fill its ~2,800-record store over a few weeks and then evict in a loop
 for readings nothing will ever deliver. **Switching to `app` deletes whatever
 is already buffered**; the reply reports how many in `"cleared"`.
 
-`off` has one risk worth knowing: with the link down, a reading goes neither to
-BLE nor to flash. Do not use it where connectivity is unreliable.
+`off` is for a site that wants readings on the server only, never on a phone.
+With the link down the reading is still stored — flash is its only copy — and
+sent when the link returns.
+
+### Where readings go — full table
+
+**`set_link_mode`** decides which radio runs:
+
+| link_mode | GSM | WiFi | BLE | Internet |
+|---|---|---|---|---|
+| `gsm` *(default)* | on | off | on | via SIM |
+| `wifi` | off | on | on | via router |
+| `off` | off | off | on | none |
+
+**`set_ble_data`** in `gsm` or `wifi` mode:
+
+| ble_data | Internet + broker up | Internet up, broker down | Internet down |
+|---|---|---|---|
+| `auto` *(default)* | BLE ⛔ · Flash ✅ | BLE ✅ · Flash ✅ | BLE ✅ · Flash ⛔ |
+| `always` | BLE ✅ · Flash ✅ | BLE ✅ · Flash ✅ | BLE ✅ · Flash ⛔ |
+| `app` | BLE ✅ · Flash ⛔ | BLE ✅ · Flash ⛔ | BLE ✅ · Flash ⛔ |
+| `off` | BLE ⛔ · Flash ✅ | BLE ⛔ · Flash ✅ | BLE ⛔ · Flash ✅ |
+
+**`set_ble_data`** in `link_mode=off`:
+
+| ble_data | BLE | Flash |
+|---|---|---|
+| `auto` / `always` / `app` | ✅ | ⛔ |
+| `off` | ⛔ | ⛔ |
+
+The rules behind it:
+
+- **Flash** follows the internet: up → stored, deleted on the broker's
+  acknowledgement; down → not stored, the app owns delivery.
+- **Exception:** with `ble_data=off` nothing goes to the phone, so the reading
+  is stored even with the internet down — flash is its only copy.
+- **`link_mode=off`** never stores: no internet, ever, so nothing could deliver it.
+- `app` turns storage off permanently by changing `store_forward`.
+- `link_mode=off` + `ble_data=off` gives the board no delivery path at all — not
+  a configuration to deploy.
+
+| Site | link_mode | ble_data |
+|---|---|---|
+| Normal, has a SIM | `gsm` | `auto` |
+| SIM failed, has WiFi | `wifi` | `auto` |
+| Operator needs live readings on the phone | `gsm` | `always` |
+| Server only, no phone access | `gsm` | `off` |
+| No network ever, phone is the only path | `off` | `auto` |
 
 **`clear_buffer`** needs `"confirm":true` as a JSON boolean — the number `1` is
 rejected. It deletes unsent milk readings from LittleFS only; meter, printer and
