@@ -27,7 +27,7 @@ extern "C" {
  ******************************************************************************/
 
 /** BLE Device name - matches Pico2W naming convention */
-#define BLE_DEVICE_NAME         "NitaraCLE4"
+#define BLE_DEVICE_NAME         "NitaraCLE5G"
 
 /** Maximum MTU size */
 #define BLE_MTU_SIZE            500

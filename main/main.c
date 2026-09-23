@@ -899,7 +899,7 @@ static esp_err_t init_nvs(void)
  * ============================================================================
  * System is ready. LED shows heartbeat.
  * Waiting for:
- * - BLE connection from mobile app (NitaraCLE4)
+ * - BLE connection from mobile app (NitaraCLE5G)
  * - WM/MA data from connected dairy devices
  * - USB commands from PC terminal (for debugging)
  */

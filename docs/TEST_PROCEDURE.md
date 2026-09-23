@@ -30,7 +30,7 @@ same way.
 **Over USB:** open a serial terminal at **115200 baud**, type the command, and
 press Enter.
 
-**Over BLE:** connect to the device named **NitaraCLE4** and send the command
+**Over BLE:** connect to the device named **NitaraCLE5G** and send the command
 as text.
 
 Every command looks like this and **must end with `#`**:
@@ -72,7 +72,7 @@ WM Module: Enabled
 MA Module: Enabled
 Printer Module: Enabled
 Battery Module: Enabled
-BLE SPP Module: Enabled (Device: NitaraCLE4)
+BLE SPP Module: Enabled (Device: NitaraCLE5G)
 ```
 
 | | |
