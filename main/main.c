@@ -92,6 +92,13 @@
 #include "link_mode.h"
 #endif
 
+// WiFi status, for the status LED
+#ifdef CONFIG_NCLE_WIFI_ENABLE
+#include "wifi_sta.h"
+#include "wifi_sta_task.h"
+#include "wifi_sta_config.h"
+#endif
+
 // Application layer: what the device does with the internet. Reaches the
 // network only through net_link, so it is identical to the WiFi product's copy.
 #ifdef CONFIG_NCLE_MQTT_ENABLE
@@ -420,7 +427,7 @@ static void fota_progress_callback(const char *json, int len)
         s_led_fota_active = true;    /* fast blink: busy, do not power off */
     } else if (strstr(json, "\"success\"") != NULL ||
                strstr(json, "\"failed\"") != NULL) {
-        s_led_fota_active = false;   /* back to the normal heartbeat */
+        s_led_fota_active = false;   /* back to the link-status pattern */
     }
     command_output_callback(json, (size_t)len);
 }
@@ -558,45 +565,227 @@ static void on_activity(void)
 // Status LED Task
 // ============================================================================
 
+/* In GSM mode there is no phone app, so the LED is the only way a user can
+ * tell whether the device is online - and, when it is not, which stage failed.
+ * The state is chosen from what the link and MQTT already report; nothing here
+ * talks to the modem or the radio. */
+
+/* Blink codes, grouped into stages a technician can act on. Code 0 = no fault. */
+#define LED_CODE_NONE           0
+
+typedef enum {
+    LED_STATE_HEARTBEAT = 0,    /* BLE mode (no internet link), or link switched off */
+    LED_STATE_CONNECTED,        /* link up AND cloud reachable -> solid ON           */
+    LED_STATE_CONNECTING,       /* coming up, or failing for less than the delay     */
+    LED_STATE_FAULT,            /* failing for longer -> blink the fault code        */
+} led_state_t;
+
+static void led_set(bool on)
+{
+    gpio_set_level(STATUS_LED_GPIO, on ? LED_ON_LEVEL : LED_OFF_LEVEL);
+}
+
+/* `count` flashes of on_ms/off_ms, then stay dark for pause_ms. */
+static void led_blinks(int count, int on_ms, int off_ms, int pause_ms)
+{
+    for (int i = 0; i < count; i++) {
+        led_set(true);
+        vTaskDelay(pdMS_TO_TICKS(on_ms));
+        led_set(false);
+        vTaskDelay(pdMS_TO_TICKS(off_ms));
+    }
+    vTaskDelay(pdMS_TO_TICKS(pause_ms));
+}
+
+#if defined(CONFIG_NCLE_GSM_ENABLE) || defined(CONFIG_NCLE_WIFI_ENABLE)
+/* Is the cloud reachable? A build without MQTT has no cloud, so a working link
+ * is the whole story there. */
+static bool led_cloud_up(void)
+{
+#ifdef CONFIG_NCLE_MQTT_ENABLE
+    return mqtt_svc_is_connected();
+#else
+    return true;
+#endif
+}
+#endif
+
+#ifdef CONFIG_NCLE_GSM_ENABLE
+/**
+ * @brief GSM blink code for the current status.
+ *
+ * The ten gsm_fault_t values are more detail than anyone can count off an LED,
+ * so they are folded into the five things a technician would actually do:
+ *   1 check power/wiring, 2 check the SIM, 3 check the antenna,
+ *   4 call the carrier,   5 check the APN / data plan.
+ *
+ * @param connected  set true when the data link is up and the cloud answers
+ * @return 1-5, or LED_CODE_NONE when nothing is wrong (connected or still
+ *         coming up).
+ */
+static int led_gsm_code(bool *connected)
+{
+    gsm_status_t s;
+    gsm_task_get_last_status(&s);     /* cached - no AT round trip */
+
+    *connected = s.data_up && led_cloud_up();
+
+    switch (s.fault) {
+        case GSM_FAULT_MODEM_DEAD:    return 1;
+        case GSM_FAULT_SIM_ABSENT:
+        case GSM_FAULT_SIM_LOCKED:
+        case GSM_FAULT_SIM_FAILURE:   return 2;
+        case GSM_FAULT_NO_SIGNAL:
+        case GSM_FAULT_WEAK_SIGNAL:   return 3;
+        case GSM_FAULT_SIM_BARRED:
+        case GSM_FAULT_NO_COVERAGE:   return 4;
+        case GSM_FAULT_NO_DATA_LINK:
+        case GSM_FAULT_NO_INTERNET:   return 5;
+        case GSM_FAULT_NONE:
+        default:                      break;
+    }
+
+    /* Data link up but the cloud is not answering. To the user that is the
+     * same as "no internet", so it shares code 5. */
+    if (s.data_up && !*connected) return 5;
+    return LED_CODE_NONE;
+}
+#endif
+
+#ifdef CONFIG_NCLE_WIFI_ENABLE
+/**
+ * @brief WiFi blink code: 1 no WiFi saved, 2 cannot join the router,
+ *        3 joined but the cloud is not answering.
+ *
+ * Asks wifi_sta directly rather than net_link: net_link registrations are
+ * permanent, so after a runtime gsm -> wifi switch its "any link provisioned"
+ * answer would include GSM and hide code 1.
+ */
+static int led_wifi_code(bool *connected)
+{
+    /* The saved SSID lives in NVS. Only looked up while not connected, and at
+     * most every 10 s - it only changes when someone provisions from the app. */
+    static bool       s_has_ssid = false;
+    static TickType_t s_checked  = 0;
+    static bool       s_checked_once = false;
+
+    wifi_sta_status_t w;
+    ncle_wifi_sta_get_status(&w);
+
+    *connected = w.connected && led_cloud_up();
+    if (*connected) return LED_CODE_NONE;
+
+    TickType_t now = xTaskGetTickCount();
+    if (!s_checked_once || (now - s_checked) >= pdMS_TO_TICKS(10000)) {
+        char ssid[WIFI_STA_SSID_MAX + 1] = {0};
+        char pass[WIFI_STA_PASSWORD_MAX + 1] = {0};
+        s_has_ssid = (ncle_wifi_sta_config_load(ssid, pass) == ESP_OK &&
+                      ssid[0] != '\0');
+        s_checked = now;
+        s_checked_once = true;
+    }
+
+    if (!s_has_ssid)   return 1;
+    if (!w.connected)  return 2;
+    return 3;
+}
+#endif
+
+/**
+ * @brief Decide what the LED should show for the current link mode.
+ *
+ * A fault is shown only after it has lasted CONFIG_NCLE_STATUS_LED_FAULT_DELAY_S.
+ * WHY: during a normal power-on the modem reports "no coverage" or "no signal"
+ * for a while as it searches, and a router can be slow to answer. Blinking a
+ * fault code then would send someone to check an antenna that is fine. Until
+ * the delay has passed, the LED shows "connecting".
+ *
+ * @param code  receives the blink count when LED_STATE_FAULT is returned
+ */
+static led_state_t led_link_state(int *code)
+{
+#if defined(CONFIG_NCLE_GSM_ENABLE) || defined(CONFIG_NCLE_WIFI_ENABLE)
+    static uint8_t    s_mode = 0xFF;
+    static bool       s_failing = false;
+    static TickType_t s_failing_since = 0;
+
+    uint8_t mode = link_mode_current();
+    if (mode != s_mode) {
+        /* New mode starts from "connecting" - never an old mode's fault. */
+        s_mode = mode;
+        s_failing = false;
+    }
+
+    bool connected = false;
+    int  c = LED_CODE_NONE;
+
+    switch (mode) {
+#ifdef CONFIG_NCLE_GSM_ENABLE
+        case LINK_MODE_GSM:
+            /* gsm_disable stops the task: nothing is trying to connect. */
+            if (!gsm_task_is_running()) return LED_STATE_HEARTBEAT;
+            c = led_gsm_code(&connected);
+            break;
+#endif
+#ifdef CONFIG_NCLE_WIFI_ENABLE
+        case LINK_MODE_WIFI:
+            if (!ncle_wifi_sta_task_is_running()) return LED_STATE_HEARTBEAT;
+            c = led_wifi_code(&connected);
+            break;
+#endif
+        default:
+            /* LINK_MODE_OFF ("BLE mode"): app-only, no internet link. */
+            return LED_STATE_HEARTBEAT;
+    }
+
+    if (connected) {
+        s_failing = false;
+        return LED_STATE_CONNECTED;
+    }
+    if (c == LED_CODE_NONE) {
+        s_failing = false;
+        return LED_STATE_CONNECTING;
+    }
+
+    /* The timer runs while ANY fault is present, not per code: a weak link
+     * flapping between "weak signal" and "no coverage" must still get shown. */
+    TickType_t now = xTaskGetTickCount();
+    if (!s_failing) {
+        s_failing = true;
+        s_failing_since = now;
+    }
+    if ((now - s_failing_since) < pdMS_TO_TICKS(CONFIG_NCLE_STATUS_LED_FAULT_DELAY_S * 1000)) {
+        return LED_STATE_CONNECTING;
+    }
+    *code = c;
+    return LED_STATE_FAULT;
+#else
+    (void)code;
+    return LED_STATE_HEARTBEAT;     /* no connectivity layer in this build */
+#endif
+}
+
 /**
  * @brief FreeRTOS task that controls the status LED
  *
  * ============================================================================
- * PURPOSE:
+ * LED BEHAVIOR (highest priority first):
  * ============================================================================
- * Provides visual indication of system status:
- * - IDLE: Slow heartbeat blink (system is running, waiting for data)
- * - ACTIVITY: Rapid blink (data is being received/processed)
+ * FIRMWARE UPDATE: 150ms on / 150ms off, continuously - do not power off
+ * READING RECEIVED: 5 quick blinks (100ms on/off), then back to the state below
  *
- * ============================================================================
- * WHY THIS FUNCTION EXISTS:
- * ============================================================================
- * User can see at a glance if the device is working and receiving data.
- * No need to check logs or connect to see status.
+ * GSM / WIFI MODE:
+ *   CONNECTED  - solid ON (link up AND MQTT connected)
+ *   CONNECTING - double blink, then a pause
+ *   FAULT      - 1-5 blinks, then a long pause (see led_gsm_code/led_wifi_code)
+ *
+ * BLE MODE (link mode off), or the link switched off:
+ *   HEARTBEAT  - 100ms on / 900ms off
  *
  * ============================================================================
  * INPUT:
  * ============================================================================
  * @param arg - FreeRTOS task argument (not used, always NULL)
- *
- * ============================================================================
- * OUTPUT:
- * ============================================================================
- * Controls GPIO pin connected to LED:
- * - Sets GPIO HIGH or LOW to turn LED on/off
- *
- * ============================================================================
- * LED BEHAVIOR:
- * ============================================================================
- * IDLE (waiting for data):
- *   - LED ON for 100ms
- *   - LED OFF for 900ms
- *   - Repeat forever (slow heartbeat)
- *
- * ACTIVITY (data received):
- *   - LED ON for 100ms, OFF for 100ms
- *   - Repeat 5 times (rapid blink)
- *   - Then return to idle heartbeat
  *
  * ============================================================================
  * RUNS:
@@ -611,10 +800,13 @@ static void led_task(void *arg)
 
     ESP_LOGI(TAG, "LED: GPIO%d (active %s)", STATUS_LED_GPIO, LED_ON_LEVEL ? "HIGH" : "LOW");
 
+    led_state_t last_state = (led_state_t)-1;
+    int         last_code  = -1;
+
     while (1) {
         if (s_led_fota_active) {
             // Firmware update in progress - continuous fast blink, distinct
-            // from both the idle heartbeat and the 5-blink activity burst.
+            // from every other pattern.
             //
             // WHY: in the field nobody watches a serial console, and a
             // technician may not have the app open. Without this the device
@@ -626,26 +818,56 @@ static void led_task(void *arg)
             //
             // Takes priority over the activity burst: during an update,
             // "updating" is the more important thing to show.
-            gpio_set_level(STATUS_LED_GPIO, LED_ON_LEVEL);
-            vTaskDelay(pdMS_TO_TICKS(150));
-            gpio_set_level(STATUS_LED_GPIO, LED_OFF_LEVEL);
-            vTaskDelay(pdMS_TO_TICKS(150));
-        } else if (s_led_activity_flag) {
-            // Activity detected - clear flag and blink rapidly 5 times
-            s_led_activity_flag = false;
+            led_blinks(1, 150, 150, 0);
+            continue;
+        }
 
-            for (int i = 0; i < 5; i++) {
-                gpio_set_level(STATUS_LED_GPIO, LED_ON_LEVEL);   // LED ON
-                vTaskDelay(pdMS_TO_TICKS(100));                   // Wait 100ms
-                gpio_set_level(STATUS_LED_GPIO, LED_OFF_LEVEL);  // LED OFF
-                vTaskDelay(pdMS_TO_TICKS(100));                   // Wait 100ms
+        if (s_led_activity_flag) {
+            // Reading received - blink rapidly 5 times, then fall back to the
+            // link state so a reading never hides a fault for long.
+            s_led_activity_flag = false;
+            led_set(false);
+            vTaskDelay(pdMS_TO_TICKS(200));   // gap, so the burst is visible after solid ON
+            led_blinks(5, 100, 100, 0);
+            continue;
+        }
+
+        int code = LED_CODE_NONE;
+        led_state_t state = led_link_state(&code);
+
+        if (state != last_state || code != last_code) {
+            static const char *names[] = { "heartbeat", "connected", "connecting", "fault" };
+            if (state == LED_STATE_FAULT) {
+                ESP_LOGI(TAG, "LED: %s, code %d", names[state], code);
+            } else {
+                ESP_LOGI(TAG, "LED: %s", names[state]);
             }
-        } else {
-            // Idle - slow heartbeat
-            gpio_set_level(STATUS_LED_GPIO, LED_ON_LEVEL);   // LED ON
-            vTaskDelay(pdMS_TO_TICKS(100));                   // Wait 100ms (short on)
-            gpio_set_level(STATUS_LED_GPIO, LED_OFF_LEVEL);  // LED OFF
-            vTaskDelay(pdMS_TO_TICKS(900));                   // Wait 900ms (long off)
+            last_state = state;
+            last_code  = code;
+        }
+
+        switch (state) {
+            case LED_STATE_CONNECTED:
+                // Solid ON. Re-checked every 250ms so a drop, a reading or an
+                // update shows almost at once.
+                led_set(true);
+                vTaskDelay(pdMS_TO_TICKS(250));
+                break;
+
+            case LED_STATE_CONNECTING:
+                led_blinks(2, 150, 150, 1400);
+                break;
+
+            case LED_STATE_FAULT:
+                // Slow enough to count, with a long gap so the count is
+                // unambiguous.
+                led_blinks(code, 250, 350, 2500);
+                break;
+
+            case LED_STATE_HEARTBEAT:
+            default:
+                led_blinks(1, 100, 900, 0);
+                break;
         }
     }
 }
