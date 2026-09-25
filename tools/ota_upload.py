@@ -11,7 +11,7 @@ Usage:
     python ota_upload.py [device_name] [firmware_file]
 
 Examples:
-    python ota_upload.py NitaraCLE4 firmware.bin
+    python ota_upload.py NitaraCLE5G firmware.bin
     python ota_upload.py                           # Uses defaults
 
 Protocol:
@@ -46,7 +46,7 @@ CHUNK_SIZE = 300  # Binary bytes per chunk (will be ~400 bytes Base64)
 RESPONSE_TIMEOUT = 10.0  # Seconds to wait for response
 
 class BleOtaUploader:
-    def __init__(self, device_name: str = "NitaraCLE4"):
+    def __init__(self, device_name: str = "NitaraCLE5G"):
         self.device_name = device_name
         self.client: Optional[BleakClient] = None
         self.response_event = asyncio.Event()
@@ -207,7 +207,7 @@ class BleOtaUploader:
 
 async def main():
     # Parse arguments
-    device_name = "NitaraCLE4"
+    device_name = "NitaraCLE5G"
     firmware_path = None
 
     if len(sys.argv) >= 2:
@@ -229,8 +229,8 @@ async def main():
     if not firmware_path:
         print("Usage: python ota_upload.py [device_name] <firmware.bin>")
         print("\nExamples:")
-        print("  python ota_upload.py NitaraCLE4 build/nitara_connector.bin")
-        print("  python ota_upload.py NitaraCLE4 firmware.bin")
+        print("  python ota_upload.py NitaraCLE5G build/nitara_connector.bin")
+        print("  python ota_upload.py NitaraCLE5G firmware.bin")
         sys.exit(1)
 
     print("=" * 50)

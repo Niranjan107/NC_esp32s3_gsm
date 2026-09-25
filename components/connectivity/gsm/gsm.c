@@ -831,16 +831,33 @@ static int gsm_link_status_json(char *buf, size_t size)
 
 void gsm_net_link_register(void)
 {
+    /* One-shot. net_link is a 2-slot append-only table with no unregister, and
+     * link_mode calls this every time the operator switches back to gsm - a
+     * second registration would take the slot WiFi needs, and the third would
+     * fail outright. The failure is quiet: the application only asks "is
+     * anything up", so a link missing from the table reads as permanently
+     * offline on a modem that is working fine. */
+    static bool s_registered = false;
+    if (s_registered) {
+        return;
+    }
+
     /* Static storage: net_link keeps the pointer, so a stack copy would
      * dangle. is_provisioned is left NULL - a SIM needs no credentials
      * entered, unlike WiFi, and net_link treats absent as "yes". */
+    /* is_enabled: the task is running. False after link_mode switches away
+     * from gsm, or when the user sent gsm_disable - in both cases nothing will
+     * ever deliver a buffered reading, so the application layer must not
+     * store one. Registration alone cannot say this: it is permanent. */
     static const net_link_t gsm_link = {
         .name        = "gsm",
         .is_up       = gsm_link_is_up,
         .status_json = gsm_link_status_json,
+        .is_enabled  = gsm_task_is_running,
     };
 
     if (net_link_register(&gsm_link)) {
+        s_registered = true;
         ESP_LOGI(TAG, "registered with net_link as '%s'", gsm_link.name);
     } else {
         ESP_LOGE(TAG, "net_link registration FAILED - the application layer "
@@ -1517,6 +1534,22 @@ esp_err_t gsm_init(void)
 esp_err_t gsm_deinit(void)
 {
     if (!s_initialized) return ESP_OK;
+
+    /* Leave data mode BEFORE anything else touches the modem.
+     *
+     * gsm_modem_deinit() below calls esp_modem_destroy(), and destroying the
+     * DCE while its worker is still parsing PPP frames is the documented
+     * crash on this board - an InstructionFetchError, seen during failure
+     * testing when a teardown ran mid-session. gsm_ppp_stop() does the
+     * ordering that avoids it: netif down, settle, then back to command mode.
+     *
+     * This costs nothing when PPP is not up (it returns INVALID_STATE on a
+     * null DCE) and it matters most in the case that is about to become
+     * routine: the operator switching to wifi while the GSM link is live. */
+    if (gsm_pdp_is_active()) {
+        ESP_LOGI(TAG, "deinit: leaving data mode before teardown");
+        gsm_ppp_stop();
+    }
 
     gsm_power_off();
     gsm_modem_deinit();

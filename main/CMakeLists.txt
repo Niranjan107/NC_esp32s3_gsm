@@ -16,6 +16,8 @@ idf_component_register(
         wm_uart_validator
         config
         gsm
+        wifi_sta
+        link_mode
         # Application layer (Step 4/5): MQTT publish + the weight merge.
         mqtt_client_svc
         wm_capture

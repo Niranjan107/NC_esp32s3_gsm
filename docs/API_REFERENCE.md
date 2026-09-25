@@ -1,5 +1,15 @@
 # NCLite ESP32-S3 Connector - API Reference
 
+> **OUT OF DATE.** This file documents 8 of the 32 commands the firmware
+> accepts, and predates GSM, MQTT, FOTA, the reading buffer and link modes -
+> it still describes MA, the printer and BLE as "planned". For the current
+> command set see **[commands.md](commands.md)**, and for connectivity see
+> **[link-modes.md](link-modes.md)**.
+>
+> Kept for the component-architecture notes below, which are still broadly
+> right apart from the flat layout (components now live under base/,
+> connectivity/ and application/).
+
 ## Project Overview
 
 NCLite ESP32-S3 is a connector device that interfaces with:

@@ -100,7 +100,7 @@ All devices communicate via UART and data is transmitted to a mobile app via **B
 | Battery ADC | - | GPIO 6 | - | - |
 
 ### BLE Configuration
-- **Device Name**: `NitaraCLE4`
+- **Device Name**: `NitaraCLE5G`
 - **MTU Size**: 500 bytes
 - **Service UUID**: `6E400001-B5A3-F393-E0A9-E50E24DCCA9E` (Nordic UART Service)
 
@@ -928,7 +928,7 @@ A Python script is provided at `tools/ota_upload.py` for testing OTA updates via
 pip install bleak
 
 # Upload firmware
-python tools/ota_upload.py NitaraCLE4 build/nitara_connector.bin
+python tools/ota_upload.py NitaraCLE5G build/nitara_connector.bin
 ```
 
 ---

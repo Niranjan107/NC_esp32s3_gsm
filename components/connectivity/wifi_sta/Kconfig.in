@@ -1,0 +1,29 @@
+menu "WiFi (STA)"
+
+    config NCLE_WIFI_ENABLE
+        bool "Enable WiFi STA"
+        default n
+        help
+            Enable WiFi station mode with BLE-based provisioning.
+            When disabled, the firmware behaves identically to the
+            non-WiFi build.
+
+    config NCLE_WIFI_DEV_CREDENTIALS
+        bool "Use developer default WiFi credentials (bench testing)"
+        depends on NCLE_WIFI_ENABLE
+        default n
+        help
+            When enabled and no credentials are stored in NVS, the device
+            auto-connects using the SSID/password below. Disable in production.
+
+    config NCLE_WIFI_DEV_SSID
+        string "Developer WiFi SSID"
+        depends on NCLE_WIFI_DEV_CREDENTIALS
+        default "MyTestAP"
+
+    config NCLE_WIFI_DEV_PASSWORD
+        string "Developer WiFi password"
+        depends on NCLE_WIFI_DEV_CREDENTIALS
+        default "password123"
+
+endmenu

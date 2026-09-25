@@ -68,6 +68,21 @@ typedef struct {
      * on, which is the safe default.
      */
     bool (*is_provisioned)(void);
+
+    /**
+     * Optional. Is this link switched ON - its stack running and trying to
+     * connect - regardless of whether it is up at this moment?
+     *
+     * Different from is_up (a working link) and from being registered at all
+     * (registration is permanent: there is no unregister). A product that lets
+     * the operator turn every link off at runtime needs this to tell "the
+     * network is down for now" from "there is no network by choice" - the
+     * second must not buffer, because nothing will ever deliver.
+     *
+     * May be NULL - the link is then assumed enabled, which is right for any
+     * product whose links cannot be switched off.
+     */
+    bool (*is_enabled)(void);
 } net_link_t;
 
 /**
@@ -135,6 +150,15 @@ int net_link_status_json(char *buf, size_t size);
  * layer can never deliver, so buffering would fill flash for nothing.
  */
 bool net_link_is_provisioned(void);
+
+/**
+ * @brief Is any registered link switched on?
+ *
+ * False when no link is registered, or when every registered link reports
+ * is_enabled() == false - e.g. an operator has turned all networking off.
+ * A link without is_enabled counts as on.
+ */
+bool net_link_any_enabled(void);
 
 #ifdef __cplusplus
 }
