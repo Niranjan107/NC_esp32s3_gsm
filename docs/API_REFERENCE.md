@@ -590,6 +590,7 @@ uint64_t get_device_id(void);
 |--------|---------|-------------|
 | `CONFIG_NCLE_STATUS_LED_GPIO` | 36 | Status LED GPIO |
 | `CONFIG_NCLE_STATUS_LED_ACTIVE_HIGH` | yes | LED active level |
+| `CONFIG_NCLE_STATUS_LED_FAULT_DELAY_S` | 40 | Seconds a fault must last before the LED blinks its code |
 | `CONFIG_NCLE_WM_ENABLE` | yes | Enable WM module |
 | `CONFIG_NCLE_WM_TX_PIN` | 43 | WM TX GPIO |
 | `CONFIG_NCLE_WM_RX_PIN` | 44 | WM RX GPIO |

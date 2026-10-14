@@ -160,8 +160,23 @@ Entry point for the application. Initializes all components in the correct order
 | `ma_ble_data_callback()` | Wrapper to send MA data to BLE |
 
 #### LED Behavior
-- **Idle**: Slow heartbeat (100ms ON, 900ms OFF)
-- **Activity**: Rapid blink 5 times (100ms ON/OFF)
+The LED shows the link status, so a user can tell the device is online without
+the app. Highest priority first:
+
+| Pattern | When |
+|---|---|
+| Fast steady blink (150ms ON/OFF) | Firmware update in progress |
+| 5 rapid blinks (100ms ON/OFF) | A reading was received, then back to the status below |
+| **Solid ON** | GSM or WiFi mode: link up **and** MQTT connected |
+| Double blink, pause | GSM or WiFi mode: connecting |
+| 1–5 blinks, long pause | GSM or WiFi mode: fault, after it has lasted `CONFIG_NCLE_STATUS_LED_FAULT_DELAY_S` (40s) |
+| Heartbeat (100ms ON, 900ms OFF) | BLE mode (link mode `off`), or the link switched off |
+
+Fault codes — GSM: 1 modem not responding, 2 SIM missing/locked/faulty,
+3 no/weak signal, 4 SIM barred/no coverage, 5 no data link or MQTT unreachable.
+WiFi: 1 no WiFi saved, 2 cannot join the router, 3 WiFi up but MQTT unreachable.
+
+Each pattern change is logged (`LED: connected`, `LED: fault, code 2`, ...).
 
 ---
 

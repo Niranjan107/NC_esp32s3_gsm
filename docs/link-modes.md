@@ -26,6 +26,23 @@ and the way back from a WiFi whose router has been replaced.
 
 ---
 
+## What the LED shows in each mode
+
+Without the app, the status LED is how a user knows whether the device is
+online.
+
+| Mode | Connected | Connecting | Fault (after 40 s) |
+|---|---|---|---|
+| **gsm** | Solid ON | Double blink | 1 modem · 2 SIM · 3 signal · 4 network/carrier · 5 data or server |
+| **wifi** | Solid ON | Double blink | 1 no WiFi saved · 2 cannot join router · 3 no internet |
+| **off** | Heartbeat (short flash every second) | — | — |
+
+"Solid ON" means readings are reaching the server — the link is up **and**
+MQTT is connected. In every mode, 5 quick blinks mean a reading was received,
+and a fast steady blink means a firmware update is running.
+
+---
+
 ## Typical use
 
 A site's SIM stops working. The operator:
