@@ -964,6 +964,18 @@ static void gsm_report_fault(gsm_fault_t f)
     ESP_LOGE(TAG, ">>> ACTION : %s", gsm_fault_action(f));
 }
 
+/* What the last traffic test (ping / HTTP) found on the current data link:
+ * -1 not tested, 0 nothing got through, 1 traffic flows. Lets the diagnostic
+ * report stage 6 from tests already run, instead of "skipped" - which on a SIM
+ * with no data balance printed six-stage OK while nothing could reach the
+ * server. */
+static int s_internet_state = -1;
+
+void gsm_note_internet(int state)
+{
+    s_internet_state = state;
+}
+
 gsm_fault_t gsm_diagnose(bool check_internet)
 {
     ESP_LOGI(TAG, "======== GSM DIAGNOSTIC ========");
@@ -984,13 +996,25 @@ gsm_fault_t gsm_diagnose(bool check_internet)
         ESP_LOGI(TAG, "[4/6] NETWORK ....... OK (registered)");
         ESP_LOGI(TAG, "[5/6] DATA .......... OK (IP assigned)");
 
-        if (!check_internet) {
-            ESP_LOGI(TAG, "[6/6] INTERNET ...... skipped");
+        /* Stage 6 from the tests already run, if any - re-pinging here would
+         * cost another 15 s to learn what we know. */
+        if (!check_internet && s_internet_state == 1) {
+            ESP_LOGI(TAG, "[6/6] INTERNET ...... OK (ping/HTTP got through)");
+            gsm_report_fault(GSM_FAULT_NONE);
             ESP_LOGI(TAG, "================================");
             return GSM_FAULT_NONE;
         }
-        if (gsm_test_ping("8.8.8.8", 3) != ESP_OK) {
-            ESP_LOGE(TAG, "[6/6] INTERNET ...... NO TRAFFIC");
+        if (!check_internet && s_internet_state < 0) {
+            ESP_LOGI(TAG, "[6/6] INTERNET ...... not tested");
+            ESP_LOGI(TAG, "================================");
+            return GSM_FAULT_NONE;
+        }
+        bool no_traffic = check_internet
+                        ? (gsm_test_ping("8.8.8.8", 3) != ESP_OK)   /* asked: test fresh */
+                        : (s_internet_state == 0);                  /* known from bring-up */
+        s_internet_state = no_traffic ? 0 : 1;
+        if (no_traffic) {
+            ESP_LOGE(TAG, "[6/6] INTERNET ...... FAILED (IP assigned, but no data gets through)");
             gsm_report_fault(GSM_FAULT_NO_INTERNET);
             ESP_LOGI(TAG, "================================");
             return GSM_FAULT_NO_INTERNET;
@@ -1228,6 +1252,11 @@ esp_err_t gsm_test_http_get(const char *url)
         .method      = HTTP_METHOD_GET,
         .timeout_ms  = 15000,
         .buffer_size = 1024,
+        /* Do NOT follow redirects. A SIM with no data balance gets its plain
+         * HTTP intercepted by the carrier and redirected to an HTTPS "recharge"
+         * page. Following it failed with a TLS setup error that hid the real
+         * cause; stopping at the redirect lets us name it. */
+        .disable_auto_redirect = true,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -1242,7 +1271,16 @@ esp_err_t gsm_test_http_get(const char *url)
         int len    = esp_http_client_get_content_length(client);
         ESP_LOGI(TAG, "=== HTTP RESULT: status=%d, content-length=%d ===",
                  status, len);
-        if (status < 200 || status >= 400) err = ESP_FAIL;
+        if (status >= 300 && status < 400) {
+            /* example.com answers 200 directly. A redirect means someone in
+             * between took the request - on a cellular link, the carrier's
+             * captive page, almost always "no data balance". */
+            ESP_LOGE(TAG, "=== HTTP REDIRECTED by the network (status %d) - carrier "
+                          "page, usually NO DATA BALANCE ===", status);
+            err = ESP_FAIL;
+        } else if (status < 200 || status >= 300) {
+            err = ESP_FAIL;
+        }
     } else {
         ESP_LOGE(TAG, "=== HTTP FAILED: %s ===", esp_err_to_name(err));
     }

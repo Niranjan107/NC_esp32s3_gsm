@@ -63,6 +63,12 @@ static uint8_t            s_sim_absent_polls = 0;
 static uint8_t            s_sim_recovery_attempts = 0;
 #define GSM_SIM_REBOOT_AFTER_ATTEMPTS  4
 
+/* Data link up (IP assigned) but nothing gets through - ping AND HTTP both
+ * failed. Typically a SIM with no data balance. Re-tested every
+ * GSM_INTERNET_RECHECK_MS so a recharge clears it without a reboot. */
+static bool               s_no_internet = false;
+#define GSM_INTERNET_RECHECK_MS  60000
+
 /**
  * @brief Forward a status to the app only when it MEANS something new.
  *
@@ -164,15 +170,26 @@ static void poll_and_report(void)
             s_last_status.net_status = GSM_NET_REGISTERED_HOME;
         }
 
-        /* Link is up and carrying traffic, so no fault to report. A stale
-         * fault from before the link came up would contradict data=1. */
-        s.fault = GSM_FAULT_NONE;
+        /* A stale fault from before the link came up would contradict data=1,
+         * so the only fault possible here is the one stage that an IP address
+         * does NOT prove: traffic actually flowing. A SIM with no data balance
+         * still gets an IP - previously this reported "Everything working"
+         * while nothing could reach the server. */
+        s.fault = s_no_internet ? GSM_FAULT_NO_INTERNET : GSM_FAULT_NONE;
 
         s_last_status = s;
         publish_if_changed(&s);
-        ESP_LOGI(TAG, "alive=1 sim=%s reg=%d rssi=%d bars=%d net=%d data=1 (DATA mode)",
-                 gsm_sim_status_str(s.sim_status), s.registered,
-                 s.rssi, s.bars, (int)s.net_status);
+        if (s.fault == GSM_FAULT_NONE) {
+            ESP_LOGI(TAG, "alive=1 sim=%s reg=%d rssi=%d bars=%d net=%d data=1 (DATA mode)",
+                     gsm_sim_status_str(s.sim_status), s.registered,
+                     s.rssi, s.bars, (int)s.net_status);
+        } else {
+            ESP_LOGW(TAG, "alive=1 sim=%s reg=%d rssi=%d bars=%d net=%d data=1 (DATA mode) "
+                          "FAULT=%s (%s)",
+                     gsm_sim_status_str(s.sim_status), s.registered,
+                     s.rssi, s.bars, (int)s.net_status,
+                     gsm_fault_name(s.fault), gsm_fault_action(s.fault));
+        }
         return;
     }
 
@@ -557,11 +574,19 @@ static void gsm_task_body(void *arg)
          * coming up. They exist to reassure whoever is watching a normal boot;
          * spending ~8 s of ping and HTTP on a link that is about to be torn
          * down just makes the operator's mode switch look hung. */
+        bool http_ok = false;
         if (s_running) {
             ping_ok = (gsm_test_ping(NULL, 4) == ESP_OK);
         }
         if (s_running) {
-            gsm_test_http_get(NULL);
+            http_ok = (gsm_test_http_get(NULL) == ESP_OK);
+        }
+
+        /* "No internet" only when BOTH fail: some carriers block ping while
+         * the internet works, and that must not raise a false alarm. */
+        if (s_running) {
+            s_no_internet = !ping_ok && !http_ok;
+            gsm_note_internet(s_no_internet ? 0 : 1);
         }
     } else {
         ESP_LOGW(TAG, "Data link not available (0x%x)", ppp_err);
@@ -581,20 +606,43 @@ static void gsm_task_body(void *arg)
      * repeating it would cost another 15s and a second round of data for an
      * answer we have. */
     s_last_fault = gsm_diagnose(false);
-    if (ping_ok) {
-        ESP_LOGI(TAG, "(internet already verified by the ping above)");
-    }
+    (void)ping_ok;
     poll_and_report();
 
     /* Wake every 1s so gsm_task_stop() is observed within ~1s */
     uint32_t accumulated_ms = 0;
     uint32_t dead_polls     = 0;
+    uint32_t recheck_ms     = 0;
     while (s_running) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         accumulated_ms += 1000;
         if (accumulated_ms >= GSM_POLL_INTERVAL_MS) {
             accumulated_ms = 0;
             poll_and_report();
+
+            /* No traffic at bring-up (typically no data balance): re-test
+             * once a minute, so recharging the SIM clears the fault - and the
+             * LED - without anyone rebooting the device. Ping first (cheap);
+             * HTTP only if ping fails, for carriers that block ping. */
+            if (s_no_internet && gsm_pdp_is_active()) {
+                recheck_ms += GSM_POLL_INTERVAL_MS;
+                if (recheck_ms >= GSM_INTERNET_RECHECK_MS) {
+                    recheck_ms = 0;
+                    bool ok = (gsm_test_ping(NULL, 2) == ESP_OK) ||
+                              (gsm_test_http_get(NULL) == ESP_OK);
+                    if (ok) {
+                        s_no_internet = false;
+                        gsm_note_internet(1);
+                        ESP_LOGI(TAG, "=== INTERNET RESTORED - data is flowing again ===");
+                        poll_and_report();      /* publish the cleared fault now */
+                    } else {
+                        ESP_LOGW(TAG, "Still no internet - %s",
+                                 gsm_fault_action(GSM_FAULT_NO_INTERNET));
+                    }
+                }
+            } else {
+                recheck_ms = 0;
+            }
 
             /* The modem can disappear AFTER a good init - a brown-out, a
              * self-reboot, a connector that moves. Two consecutive dead polls

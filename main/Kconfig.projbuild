@@ -299,7 +299,7 @@ menu "NCLite CLEV4"
 
         config NCLE_STATUS_LED_FAULT_DELAY_S
             int "Seconds a fault must last before its blink code shows"
-            default 60
+            default 40
             range 0 600
             help
                 In GSM or WiFi mode the LED shows "connecting" (double blink)

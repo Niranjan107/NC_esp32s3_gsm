@@ -153,6 +153,11 @@ const char *gsm_fault_action(gsm_fault_t f);
  */
 gsm_fault_t gsm_diagnose(bool check_internet);
 
+/* Record what the last traffic test on the current data link found:
+ * -1 not tested, 0 nothing got through, 1 traffic flows. gsm_diagnose(false)
+ * then reports stage 6 from it instead of "skipped". */
+void gsm_note_internet(int state);
+
 /* Signal strength below this (AT+CSQ scale, 0-31) is reported as WEAK: the
  * link comes and goes rather than failing cleanly. */
 #define GSM_RSSI_WEAK_THRESHOLD   10
